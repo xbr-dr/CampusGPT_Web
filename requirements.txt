@@ -11,7 +11,6 @@ langdetect
 nltk
 faiss-cpu
 thefuzz
-python-levenshtein
-python-levenshtein
+rapidfuzz
 openrouteservice-py
 streamlit-js-eval
