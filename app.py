@@ -18,9 +18,6 @@ from thefuzz import process, fuzz
 import openrouteservice
 from streamlit_js_eval import get_geolocation
 
-
-nltk.download('punkt_tab')
-
 # --------------- Configuration ---------------
 DOCUMENTS_DIR = "data/documents"
 STORAGE_DIR = "storage"
@@ -279,7 +276,7 @@ system_ready = bool(location_map)
 
 with st.sidebar:
     st.title("🏫 CampusGPT")
-    role = st.radio("Select Role", ["User", "Admin"], horizontal=True, label_visibility="collapsed")
+    role = st.radio("Select Your Role", ["User", "Admin"], horizontal=True, label_visibility="collapsed")
     st.markdown("---")
     if st.button("🗑️ Clear Chat History"):
         st.session_state.chat_history, st.session_state.last_location = [], None
