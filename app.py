@@ -1,6 +1,3 @@
-
-# app.py
-
 import streamlit as st
 import os
 import pickle
@@ -12,193 +9,190 @@ import numpy as np
 from PyPDF2 import PdfReader
 from sentence_transformers import SentenceTransformer
 from geopy.distance import geodesic
-from difflib import get_close_matches
+from langdetect import detect
 import folium
 from streamlit_folium import st_folium
 from groq import Groq
-from langdetect import detect
 import shutil
+import io
 
-# Directories
+# Paths
 DOCUMENTS_DIR = "data/documents"
 STORAGE_DIR = "storage"
-FAISS_INDEX_PATH = os.path.join(STORAGE_DIR, "faiss_index.faiss")
+INDEX_PATH = os.path.join(STORAGE_DIR, "faiss_index.faiss")
 CORPUS_PATH = os.path.join(STORAGE_DIR, "corpus.pkl")
-LOCATION_DATA_PATH = os.path.join(STORAGE_DIR, "locations.pkl")
+LOCATIONS_PATH = os.path.join(STORAGE_DIR, "locations.pkl")
 
-# Admin Password
+# Admin password (for demo; ideally use env var or secrets)
 ADMIN_PASSWORD = "1234"
 
+# Ensure directories exist
 os.makedirs(DOCUMENTS_DIR, exist_ok=True)
 os.makedirs(STORAGE_DIR, exist_ok=True)
 
+# Load models and Groq
 @st.cache_resource
-def load_models_and_groq():
-    embed_model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
-    multi_embed_model = SentenceTransformer("distiluse-base-multilingual-cased-v1")
-    groq_client = Groq(api_key="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")
+def load_models():
+    embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+    multi_embed_model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+    groq_client = Groq(api_key=st.secrets["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"])
     return embed_model, multi_embed_model, groq_client
 
-embed_model, multi_embed_model, client = load_models_and_groq()
+embed_model, multi_embed_model, client = load_models()
 
+# Download NLTK punkt
 @st.cache_resource
-def load_nltk_data():
+def setup_nltk():
     nltk.download("punkt", quiet=True)
     return True
 
-nltk_loaded = load_nltk_data()
+setup_nltk()
 
-def detect_language(text):
+# Language detection helper
+def detect_language(q):
     try:
-        lang = detect(text)
-        return {"en": "English", "ur": "Urdu", "hi": "Hindi"}.get(lang, "English")
+        code = detect(q)
+        return {"en": "English", "ur": "Urdu", "hi": "Hindi"}.get(code, "English")
     except:
         return "English"
 
-def process_uploaded_files(uploaded_files):
-    file_data = []
-    locations_from_text = {}
+# File processing
+def extract_text(file_path):
+    ext = file_path.lower()
+    if ext.endswith(".pdf"):
+        reader = PdfReader(file_path)
+        return "\n".join(page.extract_text() or "" for page in reader.pages)
+    elif ext.endswith(".txt"):
+        return open(file_path, "r", encoding="utf-8").read()
+    elif ext.endswith((".csv", ".xlsx", ".xls")):
+        df = pd.read_excel(file_path) if ext.endswith((".xlsx", ".xls")) else pd.read_csv(file_path)
+        return df.astype(str).to_csv(index=False)
+    return ""
 
-    for uploaded_file in uploaded_files:
-        file_name = uploaded_file.name
-        file_path = os.path.join(DOCUMENTS_DIR, file_name)
-        with open(file_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-
-        text = ""
-        if file_path.lower().endswith('.pdf'):
-            reader = PdfReader(file_path)
-            text = "".join(page.extract_text() + "\n" for page in reader.pages if page.extract_text())
-        elif file_path.lower().endswith('.txt'):
-            text = uploaded_file.read().decode("utf-8")
-
-        if text:
-            file_data.append({'text': text, 'source': file_name})
-            locations_from_text.update(extract_locations_from_text(text))
-
-    return file_data, locations_from_text
-
-def extract_locations_from_text(text):
+def extract_locations(text):
     patterns = [
-        r'([\w\s]{3,50}?)\s*-\s*Lat:\s*([-+]?\d{1,3}\.\d+),?\s*Lon:\s*([-+]?\d{1,3}\.\d+)',
-        r'([\w\s]{3,50}?)\s+Latitude:\s*([-+]?\d{1,3}\.\d+),?\s*Longitude:\s*([-+]?\d{1,3}\.\d+)',
-        r'([\w\s]{3,50}?)\s*\(\s*([-+]?\d{1,3}\.\d+),\s*([-+]?\d{1,3}\.\d+)\s*\)',
+        r"([\w\s]{3,50})\s*-\s*Lat\s*[:=]\s*([\d\.\-]+)\s*[,;]?\s*Lon\s*[:=]\s*([\d\.\-]+)",
+        r"([\w\s]{3,50})\s*\(\s*([\d\.\-]+)\s*,\s*([\d\.\-]+)\s*\)"
     ]
-    locations = {}
-    for pattern in patterns:
-        for match in re.finditer(pattern, text, re.IGNORECASE):
+    locs = {}
+    for pat in patterns:
+        for m in re.finditer(pat, text, re.IGNORECASE):
+            nm, lat, lon = m.groups()
+            nm = nm.strip().lower()
             try:
-                name, lat, lon = match.groups()
-                name = name.strip().lower()
-                if name not in locations:
-                    locations[name] = {'name': name, 'lat': float(lat), 'lon': float(lon)}
+                locs[nm] = {"name": nm, "lat": float(lat), "lon": float(lon)}
             except:
-                continue
-    return locations
+                pass
+    return locs
 
-def extract_sentences(text_data):
-    all_sentences = []
-    for data in text_data:
-        text = data['text']
-        if nltk_loaded:
-            sentences = nltk.sent_tokenize(text)
+def chunk_text(text, max_len=500):
+    sents = nltk.sent_tokenize(text)
+    chunks, tmp = [], ""
+    for s in sents:
+        if len(tmp) + len(s) <= max_len:
+            tmp += " " + s
         else:
-            sentences = text.split(".")
-        for s in sentences:
-            if len(s.strip()) > 25:
-                all_sentences.append({'sentence': s.strip(), 'source': data['source']})
-    return all_sentences
+            chunks.append(tmp.strip()); tmp = s
+    if tmp: chunks.append(tmp.strip())
+    return chunks
 
-def build_and_save_index(corpus, locations):
-    sentences_to_embed = [item['sentence'] for item in corpus]
-    embeddings = embed_model.encode(sentences_to_embed, show_progress_bar=True)
+def build_index_and_save(docs, locations):
+    corpus = []
+    for doc in docs:
+        txt = extract_text(doc)
+        for chunk in chunk_text(txt):
+            corpus.append({"sentence": chunk, "source": os.path.basename(doc)})
+    embeddings = embed_model.encode([c["sentence"] for c in corpus], show_progress_bar=True)
     index = faiss.IndexFlatL2(embeddings.shape[1])
     index.add(np.array(embeddings, dtype="float32"))
-    faiss.write_index(index, FAISS_INDEX_PATH)
-    with open(CORPUS_PATH, "wb") as f:
-        pickle.dump(corpus, f)
-    with open(LOCATION_DATA_PATH, "wb") as f:
-        pickle.dump(locations, f)
+    faiss.write_index(index, INDEX_PATH)
+    with open(CORPUS_PATH, "wb") as f: pickle.dump(corpus, f)
+    with open(LOCATIONS_PATH, "wb") as f: pickle.dump(locations, f)
 
-def load_system_data():
-    if os.path.exists(FAISS_INDEX_PATH):
-        index = faiss.read_index(FAISS_INDEX_PATH)
-        with open(CORPUS_PATH, "rb") as f: corpus = pickle.load(f)
-        with open(LOCATION_DATA_PATH, "rb") as f: locations = pickle.load(f)
+def load_index_and_data():
+    if os.path.exists(INDEX_PATH):
+        index = faiss.read_index(INDEX_PATH)
+        corpus = pickle.load(open(CORPUS_PATH, "rb"))
+        locations = pickle.load(open(LOCATIONS_PATH, "rb"))
         return index, corpus, locations
     return None, None, {}
 
-def retrieve_chunks(query, corpus, index, language):
-    model = multi_embed_model if language != "English" else embed_model
-    query_embedding = model.encode([query])
-    _, I = index.search(np.array(query_embedding, dtype="float32"), 5)
+def retrieve_chunks(q, corpus, index, lang):
+    model = multi_embed_model if lang != "English" else embed_model
+    emb = model.encode([q])
+    _, I = index.search(np.array(emb, dtype="float32"), 5)
     return [corpus[i] for i in I[0] if i < len(corpus)]
 
-def ask_chatbot(query, context_chunks, locations, language):
-    context = "\n".join([chunk['sentence'] for chunk in context_chunks])
-    system_prompt = {
-        "English": "You are CampusGPT, a smart assistant. Answer concisely.",
-        "Urdu": "آپ کیمپسGPT ہیں۔ مختصر اور مفید جواب دیں۔",
-        "Hindi": "आप CampusGPT हैं। संक्षेप में और सहायक उत्तर दें।"
-    }.get(language, "You are CampusGPT.")
-
-    prompt = f"""{system_prompt}
-CONTEXT: {context}
-LOCATIONS: {locations}
-QUESTION: {query}
-"""
-
-    response = client.chat.completions.create(
-        model="llama3-8b-8192",
+def ask_groq(q, context, locations_text, lang):
+    prompt = f"You are a helpful assistant. Answer in {lang}.\n\nCONTEX: {context}\n\nLOCATIONS: {locations_text}\n\nQ: {q}"
+    resp = client.chat.completions.create(
+        model="meta-llama/llama-4-scout-17b-16e-instruct",
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.6,
-        max_tokens=1024
+        temperature=0.7,
+        max_completion_tokens=512,
+        top_p=1
     )
-    return response.choices[0].message.content
+    return resp.choices[0].message.content.strip()
+
+def show_map(locs):
+    if not locs: return
+    center = [np.mean([l["lat"] for l in locs]), np.mean([l["lon"] for l in locs])]
+    m = folium.Map(location=center, zoom_start=17)
+    for l in locs:
+        folium.Marker([l["lat"], l["lon"]], popup=l["name"].title()).add_to(m)
+    st_folium(m, height=400)
 
 # Streamlit app
-st.set_page_config("CampusGPT", "🏫")
-st.title("🏫 CampusGPT")
+st.set_page_config(page_title="CampusGPT", layout="wide")
+st.title("CampusGPT — Your Smart Campus Assistant")
 
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
+
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
-role = st.sidebar.radio("Select Role", ["User", "Admin"], horizontal=True)
+role = st.sidebar.radio("Role:", ["User", "Admin"])
 
-index, corpus, location_map = load_system_data()
-system_ready = index is not None
+index, corpus, locations = load_index_and_data()
+ready = index is not None
 
 if role == "Admin":
     if not st.session_state.authenticated:
-        password = st.text_input("Enter Admin Password", type="password")
+        pwd = st.text_input("Admin Password:", type="password")
         if st.button("Login"):
-            if password == ADMIN_PASSWORD:
+            if pwd == ADMIN_PASSWORD:
                 st.session_state.authenticated = True
-                st.rerun()
+                st.success("Logged in!")
             else:
-                st.error("Incorrect password.")
+                st.error("Wrong password.")
     else:
-        st.subheader("Upload Campus Documents")
-        uploaded_files = st.file_uploader("Upload PDF or TXT files", type=["pdf", "txt"], accept_multiple_files=True)
-        if st.button("Process & Build Index"):
-            file_data, locs = process_uploaded_files(uploaded_files)
-            corpus_sentences = extract_sentences(file_data)
-            if corpus_sentences:
-                build_and_save_index(corpus_sentences, locs)
-                st.success("Index built successfully.")
+        st.header("Upload Documents")
+        up = st.file_uploader("PDF/TXT/CSV/XLSX/XLS", accept_multiple_files=True, type=["pdf","txt","csv","xlsx","xls"])
+        if st.button("Process & Build"):
+            docs = []
+            all_locs = {}
+            for f in up:
+                path = os.path.join(DOCUMENTS_DIR, f.name)
+                with open(path, "wb") as fp: fp.write(f.read())
+                docs.append(path)
+                all_locs.update(extract_locations(extract_text(path)))
+            if docs:
+                build_index_and_save(docs, all_locs)
+                index, corpus, locations = load_index_and_data()
+                st.success(f"Indexed {len(corpus)} chunks and {len(locations)} locations.")
 else:
-    if not system_ready:
-        st.warning("System is not ready. Please contact Admin.")
+    if not ready:
+        st.info("System not ready. Admin needs to build index.")
     else:
-        for chat in st.session_state.chat_history:
-            st.markdown(f"**You:** {chat['user']}")
-            st.markdown(f"**CampusGPT:** {chat['bot']}")
-        if user_input := st.chat_input("Ask me anything..."):
-            lang = detect_language(user_input)
-            results = retrieve_chunks(user_input, corpus, index, lang)
-            loc_str = ", ".join([f"{v['name']}({v['lat']},{v['lon']})" for v in location_map.values()])
-            response = ask_chatbot(user_input, results, loc_str, lang)
-            st.session_state.chat_history.append({"user": user_input, "bot": response})
-            st.rerun()
+        for turn in st.session_state.chat_history:
+            st.markdown(f"**You:** {turn['user']}")
+            st.markdown(f"**CampusGPT:** {turn['bot']}")
+        if q := st.chat_input("Ask anything..."):
+            lang = detect_language(q)
+            ctx = retrieve_chunks(q, corpus, index, lang)
+            locs = [v for k,v in locations.items() if k in q.lower()]
+            loc_text = ", ".join([f"{l['name']}({l['lat']},{l['lon']})" for l in locs])
+            resp = ask_groq(q, "\n".join(c["sentence"] for c in ctx), loc_text, lang)
+            st.session_state.chat_history.append({"user": q, "bot": resp})
+            st.experimental_rerun()
