@@ -35,7 +35,7 @@ os.makedirs(STORAGE_DIR, exist_ok=True)
 def load_models():
     embed_model = SentenceTransformer("all-MiniLM-L6-v2")
     multi_embed_model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
-    groq_client = Groq(api_key=st.secrets["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"])
+    groq_client = Groq(api_key=st.secrets[GROQ_API_KEY])
     return embed_model, multi_embed_model, groq_client
 
 embed_model, multi_embed_model, client = load_models()
