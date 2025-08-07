@@ -10,3 +10,4 @@ groq
 langdetect
 nltk
 faiss-cpu
+punkt_tab
