@@ -17,6 +17,8 @@ from io import StringIO
 import shutil
 from langdetect import detect, LangDetectException
 
+
+nltk.download('punkt_tab')
 # --------------- Configuration ---------------
 # Directories for storing data and uploaded documents
 DOCUMENTS_DIR = "data/documents"
