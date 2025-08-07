@@ -17,8 +17,6 @@ from io import StringIO
 import shutil
 from langdetect import detect, LangDetectException
 
-nltk.download('punkt_tab')
-
 # --------------- Configuration ---------------
 # Directories for storing data and uploaded documents
 DOCUMENTS_DIR = "data/documents"
@@ -61,12 +59,21 @@ embed_model, client = load_models_and_groq()
 
 @st.cache_resource
 def load_nltk_data():
-    """Download NLTK data for sentence tokenization."""
+    """
+    FIXED: Download and verify NLTK 'punkt' data for sentence tokenization.
+    This is a more robust way to handle it, especially for cloud deployments.
+    """
     try:
-        nltk.download("punkt", quiet=True)
-        return True
-    except Exception:
-        return False
+        nltk.data.find('tokenizers/punkt')
+    except LookupError:
+        try:
+            nltk.download("punkt", quiet=True)
+            # Verify again after download attempt
+            nltk.data.find('tokenizers/punkt')
+        except Exception as e:
+            st.error(f"❌ Failed to download or find NLTK 'punkt' data: {e}. Sentence tokenization may be suboptimal.")
+            return False
+    return True
 
 
 nltk_loaded = load_nltk_data()
@@ -137,7 +144,6 @@ def extract_sentences(text_data):
 
         for s in sentences:
             s_clean = s.strip()
-            # Filter out very short or non-sensical snippets
             if len(s_clean) > 25:
                 all_sentences.append({'sentence': s_clean, 'source': source})
     return all_sentences
@@ -164,40 +170,64 @@ def extract_locations_from_text(text):
     return locations
 
 
-def build_and_save_index(corpus, locations):
-    """Create FAISS index and save all processed data."""
-    if not corpus or not embed_model:
-        st.error("❌ Cannot build index: No sentences or embedding model available.")
-        return False
+def build_and_save_data(corpus, locations):
+    """
+    FIXED: Creates FAISS index and saves data. Handles cases where
+    either corpus or locations might be empty.
+    """
+    saved_sentences = 0
+    saved_locations = 0
+
     try:
-        sentences_to_embed = [item['sentence'] for item in corpus]
-        embeddings = embed_model.encode(sentences_to_embed, show_progress_bar=True)
-        index = faiss.IndexFlatL2(embeddings.shape[1])
-        index.add(np.array(embeddings, dtype="float32"))
-        faiss.write_index(index, FAISS_INDEX_PATH)
+        # Handle sentences and FAISS index
+        if corpus and embed_model:
+            sentences_to_embed = [item['sentence'] for item in corpus]
+            embeddings = embed_model.encode(sentences_to_embed, show_progress_bar=True)
+            index = faiss.IndexFlatL2(embeddings.shape[1])
+            index.add(np.array(embeddings, dtype="float32"))
+            faiss.write_index(index, FAISS_INDEX_PATH)
+            with open(CORPUS_PATH, "wb") as f:
+                pickle.dump(corpus, f)
+            saved_sentences = len(corpus)
+        else:
+            # If no corpus, ensure old index/corpus files are removed
+            if os.path.exists(FAISS_INDEX_PATH): os.remove(FAISS_INDEX_PATH)
+            if os.path.exists(CORPUS_PATH): os.remove(CORPUS_PATH)
 
-        with open(CORPUS_PATH, "wb") as f:
-            pickle.dump(corpus, f)
-        with open(LOCATION_DATA_PATH, "wb") as f:
-            pickle.dump(locations, f)
+        # Handle locations
+        if locations:
+            with open(LOCATION_DATA_PATH, "wb") as f:
+                pickle.dump(locations, f)
+            saved_locations = len(locations)
+        else:
+            # If no locations, ensure old location file is removed
+            if os.path.exists(LOCATION_DATA_PATH): os.remove(LOCATION_DATA_PATH)
 
-        return True
+        return True, saved_sentences, saved_locations
+
     except Exception as e:
-        st.error(f"❌ Error building index: {e}")
-        return False
+        st.error(f"❌ Error building/saving data: {e}")
+        return False, 0, 0
 
 
 def load_system_data():
-    """Load FAISS index, corpus, and location data from disk."""
+    """
+    FIXED: Load FAISS index, corpus, and location data from disk.
+    Handles cases where parts of the data may be missing.
+    """
+    index, corpus, location_map = None, [], {} # Initialize with safe defaults
     try:
-        if os.path.exists(FAISS_INDEX_PATH):
+        if os.path.exists(FAISS_INDEX_PATH) and os.path.exists(CORPUS_PATH):
             index = faiss.read_index(FAISS_INDEX_PATH)
-            with open(CORPUS_PATH, "rb") as f: corpus = pickle.load(f)
-            with open(LOCATION_DATA_PATH, "rb") as f: location_map = pickle.load(f)
-            return index, corpus, location_map
+            with open(CORPUS_PATH, "rb") as f:
+                corpus = pickle.load(f)
+        if os.path.exists(LOCATION_DATA_PATH):
+            with open(LOCATION_DATA_PATH, "rb") as f:
+                location_map = pickle.load(f)
     except Exception as e:
-        st.error(f"⚠️ Error loading system data: {e}")
-    return None, None, {}
+        st.error(f"⚠️ Error loading system data: {e}. Some data may be corrupt.")
+        return None, [], {} # Return safe defaults on error
+    return index, corpus, location_map
 
 
 # --------------- RAG & Chat Functions ---------------
@@ -219,21 +249,18 @@ def match_locations(query, location_map):
     query_lower = query.lower()
     found = []
 
-    # Exact match first
     for name, loc in location_map.items():
         if name in query_lower:
             found.append(loc)
 
-    # Fuzzy match if no exact matches found
     if not found:
-        query_words = query_lower.split()
+        query_words = re.findall(r'\b\w+\b', query_lower)
         location_names = list(location_map.keys())
         for word in query_words:
             matches = get_close_matches(word, location_names, n=1, cutoff=0.8)
             if matches:
                 found.append(location_map[matches[0]])
 
-    # Return unique locations
     return list({loc['name']: loc for loc in found}.values())
 
 
@@ -255,13 +282,12 @@ def ask_chatbot(query, context_chunks, geo_context, distance_info):
     if not client:
         return "The AI assistant is currently offline. Please ensure the GROQ_API_KEY is configured by an administrator."
 
-    # Auto-detect language of the query
     try:
         lang_code = detect(query)
         lang_map = {'en': 'English', 'ur': 'Urdu', 'hi': 'Hindi'}
-        language = lang_map.get(lang_code, 'English') # Default to English if lang not in map
+        language = lang_map.get(lang_code, 'English')
     except LangDetectException:
-        language = "English" # Default to English for very short/unclear queries
+        language = "English"
 
     context = "\n".join([chunk['sentence'] for chunk in context_chunks])
     sources_text = "\n".join(list(set([f"- {chunk['source']}" for chunk in context_chunks])))
@@ -301,8 +327,7 @@ def create_map(locations):
         map_center = [np.mean([loc['lat'] for loc in locations]), np.mean([loc['lon'] for loc in locations])]
         m = folium.Map(location=map_center, zoom_start=16, tiles='CartoDB positron', attr='CampusGPT Map')
         for loc in locations:
-            # Correct Google Maps URL
-            Maps_url = f"https://www.google.com/maps?q={loc['lat']},{loc['lon']}"
+            Maps_url = f"https://www.google.com/maps/search/?api=1&query={loc['lat']},{loc['lon']}"
 
             popup_html = f"""
             <div style="width: 220px; font-family: 'Inter', sans-serif;">
@@ -343,79 +368,57 @@ def display_welcome_message():
 # --------------- Main Streamlit App ---------------
 st.set_page_config(page_title="CampusGPT", page_icon="🏫", layout="wide")
 
-# Custom CSS for a modern look
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
     html, body, [class*="st-"] { font-family: 'Inter', sans-serif; }
-
-    .block-container { max-width: 80rem; padding-left: 2rem; padding-right: 2rem; padding-top: 1rem; }
+    .block-container { max-width: 80rem; padding: 1rem 2rem 2rem; }
     .main-header { text-align: center; margin-bottom: 2rem; }
     .main-header h1 { font-size: 3.5rem; font-weight: 700; background: -webkit-linear-gradient(45deg, #5850ec, #a855f7); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
     .main-header p { color: #6b7280; font-size: 1.1rem; }
-
-    .st-emotion-cache-1y4p8pa { padding-top: 4rem; }
-
     .chat-message { display: flex; align-items: flex-start; max-width: 85%; margin-bottom: 1.5rem; }
     .chat-bubble { padding: 1rem 1.25rem; border-radius: 1.25rem; box-shadow: 0 4px 6px rgba(0,0,0,0.05); line-height: 1.6; }
-
     .user-message { justify-content: flex-end; margin-left: auto; }
     .user-message .chat-bubble { background-color: #5850ec; color: white; border-bottom-right-radius: 0.25rem; }
     .user-message .chat-icon { margin-left: 0.75rem; }
-
     .assistant-message { justify-content: flex-start; }
     .assistant-message .chat-bubble { background-color: #f1f5f9; color: #1e293b; border-bottom-left-radius: 0.25rem; }
     .assistant-message .chat-bubble a { color: #5850ec; font-weight: 600; }
     .assistant-message .chat-icon { margin-right: 0.75rem; }
-
     .chat-icon { font-size: 1.5rem; color: #94a3b8; align-self: flex-start; margin-top: 0.25rem;}
-
     .welcome-card { background-color: #f8fafc; border-left: 5px solid #5850ec; padding: 2rem; border-radius: 0.5rem; margin-top: 2rem; }
-
     .stTabs [data-baseweb="tab-list"] { gap: 24px; }
     .stTabs [data-baseweb="tab"] { height: 44px; background-color: #f1f5f9; border-radius: 8px; }
     .stTabs [aria-selected="true"] { background-color: #5850ec; color: white; }
-
     .stButton>button { border-radius: 8px; }
-
     .sidebar-footer { text-align: center; position: absolute; bottom: 20px; width: 80%; color: #888; }
 </style>
 """, unsafe_allow_html=True)
 
-# Initialize session state
 if "chat_history" not in st.session_state: st.session_state.chat_history = []
 if "authenticated" not in st.session_state: st.session_state.authenticated = False
 if 'confirm_delete' not in st.session_state: st.session_state.confirm_delete = False
 
-
-# Load data once
 index, corpus, location_map = load_system_data()
-system_ready = all([index is not None, corpus is not None])
+# FIXED: The system is ready if we have text to search OR locations to map.
+system_ready = (index is not None and corpus) or bool(location_map)
 
-# --- Sidebar ---
 with st.sidebar:
     st.title("🏫 CampusGPT")
     st.markdown("---")
-
     role = st.radio("Select Your Role", ["👤 User", "🔧 Admin"], horizontal=True)
-
     if st.button("🗑️ Clear Chat History"):
         st.session_state.chat_history = []
         st.toast("Chat history cleared!", icon="🔄")
         st.rerun()
-
     st.markdown("---")
     st.markdown("<div class='sidebar-footer'>Made with ❤️ by Zubair Yamin Suhaib</div>", unsafe_allow_html=True)
 
-# --- Main Page Content ---
-st.markdown("<div class='main-header'><h1>CampusGPT</h1><p>Your Smart Campus Assistant</p></div>",
-            unsafe_allow_html=True)
+st.markdown("<div class='main-header'><h1>CampusGPT</h1><p>Your Smart Campus Assistant</p></div>", unsafe_allow_html=True)
 
-# Stop app if Groq client isn't initialized (e.g., missing API key)
 if not client and role == "👤 User":
     st.error("🔴 The AI Assistant is not configured. An administrator must set the GROQ_API_KEY in the Streamlit secrets.")
     st.stop()
-
 
 if role == "🔧 Admin":
     if not st.session_state.authenticated:
@@ -427,36 +430,33 @@ if role == "🔧 Admin":
                 st.rerun()
             else:
                 st.error("❌ Incorrect password.")
-    else:  # Authenticated Admin View
+    else:
         st.subheader("⚙️ Admin Control Panel")
         tab1, tab2, tab3 = st.tabs(["📤 Upload & Process", "ℹ️ System Info & Management", "📋 CSV Guide"])
 
         with tab1:
             st.info("Upload documents (PDF, TXT) for general info and CSVs for location data.", icon="💡")
-            uploaded_files = st.file_uploader("Upload Campus Documents", type=['pdf', 'txt', 'csv'],
-                                              accept_multiple_files=True)
+            uploaded_files = st.file_uploader("Upload Campus Documents", type=['pdf', 'txt', 'csv'], accept_multiple_files=True)
 
             if st.button("🔄 Process & Build Index", type="primary"):
                 if uploaded_files:
                     with st.spinner("Processing files, this may take a moment..."):
                         file_data, csv_locs = process_uploaded_files(uploaded_files)
-
-                        full_text_for_loc_extraction = " ".join([d['text'] for d in file_data])
-
-                        text_locs = extract_locations_from_text(full_text_for_loc_extraction)
+                        full_text = " ".join([d['text'] for d in file_data])
+                        text_locs = extract_locations_from_text(full_text)
                         all_locations = {**csv_locs, **text_locs}
-
                         corpus_sentences = extract_sentences(file_data)
 
-                        if corpus_sentences:
-                            if build_and_save_index(corpus_sentences, all_locations):
-                                st.success(
-                                    f"✅ Index built successfully with {len(corpus_sentences)} sentences and {len(all_locations)} locations.")
+                        # FIXED: Use the new flexible saving function
+                        success, num_sentences, num_locations = build_and_save_data(corpus_sentences, all_locations)
+
+                        if success:
+                            if num_sentences > 0 or num_locations > 0:
+                                st.success(f"✅ Processing complete! Saved {num_sentences} sentences and {num_locations} locations.")
                                 st.balloons()
                             else:
-                                st.error("❌ Failed to build index.")
-                        else:
-                            st.warning("⚠️ No text could be extracted to build an index.")
+                                st.warning("⚠️ No processable sentences or locations were found in the uploaded files.")
+                        # An error message is already shown by build_and_save_data
                 else:
                     st.warning("Please upload at least one file.", icon="❗")
 
@@ -466,85 +466,61 @@ if role == "🔧 Admin":
             col1, col2 = st.columns(2)
             col1.metric("Indexed Sentences", len(corpus) if corpus else 0)
             col2.metric("Known Locations", len(location_map) if location_map else 0)
-
             with st.expander("📍 View Available Locations"):
                 if location_map:
                     for name in sorted(location_map.keys()): st.write(f"• {name.title()}")
                 else:
                     st.write("No locations loaded.")
-
             st.markdown("---")
             st.subheader("🚨 Danger Zone")
             if st.button("🗑️ Clear All Data & Index", type="secondary"):
                 st.session_state.confirm_delete = True
-
             if st.session_state.confirm_delete:
-                st.warning(
-                    "**Are you sure?** This will delete all uploaded documents and the search index. This action cannot be undone.")
+                st.warning("**Are you sure?** This will delete all processed data and the search index. This action cannot be undone.")
                 col_del_1, col_del_2 = st.columns(2)
                 if col_del_1.button("Yes, I am sure, delete everything.", type="primary"):
                     try:
                         if os.path.exists(STORAGE_DIR): shutil.rmtree(STORAGE_DIR)
                         if os.path.exists(DOCUMENTS_DIR): shutil.rmtree(DOCUMENTS_DIR)
-                        os.makedirs(DOCUMENTS_DIR, exist_ok=True)
-                        os.makedirs(STORAGE_DIR, exist_ok=True)
+                        os.makedirs(DOCUMENTS_DIR, exist_ok=True); os.makedirs(STORAGE_DIR, exist_ok=True)
                         st.session_state.confirm_delete = False
                         st.success("All system data has been cleared.")
                         st.rerun()
-                    except Exception as e:
-                        st.error(f"Failed to clear data: {e}")
+                    except Exception as e: st.error(f"Failed to clear data: {e}")
                 if col_del_2.button("Cancel"):
-                     st.session_state.confirm_delete = False
-                     st.rerun()
+                     st.session_state.confirm_delete = False; st.rerun()
 
         with tab3:
-            st.markdown("""
-            Your CSV file should contain columns for the location's name, latitude, and longitude. A description column is optional but recommended.
-            Column names can be flexible (e.g., 'name' or 'location'; 'lat' or 'latitude').
-            **Example:**
-            """)
-            sample_df = pd.DataFrame({
-                'name': ['Central Library', 'Student Center'], 'latitude': [34.0522, 34.0518],
-                'longitude': [-118.2437, -118.2434], 'description': ['Main campus library with study rooms.', 'A hub for student activities and dining.']
-            })
+            st.markdown("Your CSV file should contain columns for the location's name, latitude, and longitude. A description column is optional but recommended.")
+            sample_df = pd.DataFrame({'name': ['Central Library', 'Student Center'], 'latitude': [34.0522, 34.0518], 'longitude': [-118.2437, -118.2434], 'description': ['Main campus library.', 'Hub for student activities.']})
             st.dataframe(sample_df, use_container_width=True)
-            st.download_button("⬇️ Download CSV Template", sample_df.to_csv(index=False).encode('utf-8'),
-                               "campus_locations_template.csv", "text/csv")
+            st.download_button("⬇️ Download CSV Template", sample_df.to_csv(index=False).encode('utf-8'), "campus_locations_template.csv", "text/csv")
 
 else:  # User View
     if not system_ready:
         display_welcome_message()
     else:
-        # Display chat history
         for i, message in enumerate(st.session_state.chat_history):
             if message["role"] == "user":
                 st.markdown(f'<div class="chat-message user-message"><div class="chat-bubble">{message["content"]}</div><div class="chat-icon">👤</div></div>', unsafe_allow_html=True)
-            else:  # Assistant
+            else:
                 st.markdown(f'<div class="chat-message assistant-message"><div class="chat-icon">🏫</div><div class="chat-bubble">{message["content"]}</div></div>', unsafe_allow_html=True)
                 if "locations" in message and message["locations"]:
                     map_obj = create_map(message["locations"])
                     if map_obj:
                         st_folium(map_obj, width=700, height=400, key=f"map_{i}")
 
-        # Chat input
         if prompt := st.chat_input("Ask about campus locations, distances, or general info..."):
             st.session_state.chat_history.append({"role": "user", "content": prompt})
             st.rerun()
 
-        # Generate response if last message was from user
         if st.session_state.chat_history and st.session_state.chat_history[-1]["role"] == "user":
             with st.spinner("🤔 Thinking..."):
                 last_prompt = st.session_state.chat_history[-1]["content"]
-
                 retrieved_chunks = retrieve_chunks(last_prompt, corpus, index)
-
                 locations = match_locations(last_prompt, location_map)
                 location_info = "\n".join([f"{loc['name'].title()}: (Lat: {loc['lat']}, Lon: {loc['lon']})" for loc in locations])
                 distance_info = compute_distance_info(locations)
-
                 response = ask_chatbot(last_prompt, retrieved_chunks, location_info, distance_info)
-
-                st.session_state.chat_history.append({
-                    "role": "assistant", "content": response, "locations": locations
-                })
+                st.session_state.chat_history.append({"role": "assistant", "content": response, "locations": locations})
                 st.rerun()
