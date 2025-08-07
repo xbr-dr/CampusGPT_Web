@@ -17,8 +17,6 @@ from io import StringIO
 import shutil
 from langdetect import detect, LangDetectException
 
-
-nltk.download('punkt_tab')
 # --------------- Configuration ---------------
 # Directories for storing data and uploaded documents
 DOCUMENTS_DIR = "data/documents"
@@ -62,7 +60,7 @@ embed_model, client = load_models_and_groq()
 @st.cache_resource
 def load_nltk_data():
     """
-    FIXED: Download and verify NLTK 'punkt' data for sentence tokenization.
+    Download and verify NLTK 'punkt' data for sentence tokenization.
     This is a more robust way to handle it, especially for cloud deployments.
     """
     try:
@@ -174,7 +172,7 @@ def extract_locations_from_text(text):
 
 def build_and_save_data(corpus, locations):
     """
-    FIXED: Creates FAISS index and saves data. Handles cases where
+    Creates FAISS index and saves data. Handles cases where
     either corpus or locations might be empty.
     """
     saved_sentences = 0
@@ -214,7 +212,7 @@ def build_and_save_data(corpus, locations):
 
 def load_system_data():
     """
-    FIXED: Load FAISS index, corpus, and location data from disk.
+    Load FAISS index, corpus, and location data from disk.
     Handles cases where parts of the data may be missing.
     """
     index, corpus, location_map = None, [], {} # Initialize with safe defaults
@@ -329,6 +327,7 @@ def create_map(locations):
         map_center = [np.mean([loc['lat'] for loc in locations]), np.mean([loc['lon'] for loc in locations])]
         m = folium.Map(location=map_center, zoom_start=16, tiles='CartoDB positron', attr='CampusGPT Map')
         for loc in locations:
+            # FIXED: Use a standard and reliable Google Maps URL
             Maps_url = f"https://www.google.com/maps/search/?api=1&query={loc['lat']},{loc['lon']}"
 
             popup_html = f"""
@@ -402,7 +401,7 @@ if "authenticated" not in st.session_state: st.session_state.authenticated = Fal
 if 'confirm_delete' not in st.session_state: st.session_state.confirm_delete = False
 
 index, corpus, location_map = load_system_data()
-# FIXED: The system is ready if we have text to search OR locations to map.
+# The system is ready if we have text to search OR locations to map.
 system_ready = (index is not None and corpus) or bool(location_map)
 
 with st.sidebar:
@@ -449,7 +448,7 @@ if role == "🔧 Admin":
                         all_locations = {**csv_locs, **text_locs}
                         corpus_sentences = extract_sentences(file_data)
 
-                        # FIXED: Use the new flexible saving function
+                        # Use the new flexible saving function
                         success, num_sentences, num_locations = build_and_save_data(corpus_sentences, all_locations)
 
                         if success:
