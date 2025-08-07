@@ -12,7 +12,6 @@ nltk
 faiss-cpu
 thefuzz
 python-levenshtein
-thefuzz
 python-levenshtein
 openrouteservice-py
 streamlit-js-eval
