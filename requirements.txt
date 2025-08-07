@@ -10,3 +10,5 @@ groq
 langdetect
 nltk
 faiss-cpu
+thefuzz
+python-levenshtein
