@@ -1,3 +1,0 @@
-swig
-cmake
-python3-dev
