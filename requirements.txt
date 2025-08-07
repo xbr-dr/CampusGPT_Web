@@ -4,13 +4,6 @@ numpy
 PyPDF2
 sentence-transformers
 geopy
-folium
-streamlit-folium
-groq
-langdetect
 nltk
-faiss-cpu==1.7.4
-thefuzz
-rapidfuzz
-openrouteservice-py
-streamlit-js-eval
+langdetect
+groq
