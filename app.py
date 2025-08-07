@@ -1,769 +1,447 @@
 import streamlit as st
-import os
-import pickle
-import faiss
-import nltk
-import re
 import pandas as pd
+import PyPDF2
 import numpy as np
-from PyPDF2 import PdfReader
-from sentence_transformers import SentenceTransformer
-from geopy.distance import geodesic
-from difflib import get_close_matches
+import faiss
 import folium
 from streamlit_folium import st_folium
+from sentence_transformers import SentenceTransformer
+from langdetect import detect
+import io
+import json
+import os
+import re
 from groq import Groq
-import shutil
-from langdetect import detect, LangDetectException
-import html
+import pickle
+from typing import List, Dict, Tuple, Optional
 
-nltk.download('punkt_tab')
-
-# --------------- Configuration ---------------
-DOCUMENTS_DIR = "data/documents"
-STORAGE_DIR = "storage"
-FAISS_INDEX_PATH = os.path.join(STORAGE_DIR, "faiss_index.faiss")
-CORPUS_PATH = os.path.join(STORAGE_DIR, "corpus.pkl")
-LOCATION_DATA_PATH = os.path.join(STORAGE_DIR, "locations.pkl")
-ADMIN_PASSWORD = "1234"
-
-os.makedirs(DOCUMENTS_DIR, exist_ok=True)
-os.makedirs(STORAGE_DIR, exist_ok=True)
-
-# --------------- Initialization & Caching ---------------
-@st.cache_resource
-def load_models_and_groq():
-    """Load sentence transformer model and initialize Groq client."""
-    try:
-        embed_model = SentenceTransformer("distiluse-base-multilingual-cased-v1")
-        api_key = st.secrets.get("GROQ_API_KEY")
-        if not api_key:
-            st.warning("⚠️ Groq API key not found. Please add it to your Streamlit secrets.", icon="🔒")
-            return embed_model, None
-        groq_client = Groq(api_key=api_key)
-        return embed_model, groq_client
-    except Exception as e:
-        st.error(f"❌ Error loading models or initializing Groq: {e}")
-        return None, None
-
-embed_model, client = load_models_and_groq()
-
-@st.cache_resource
-def load_nltk_data():
-    """Download and verify NLTK 'punkt' data for sentence tokenization."""
-    try:
-        nltk.data.find('tokenizers/punkt')
-    except LookupError:
-        try:
-            nltk.download("punkt", quiet=True)
-            nltk.data.find('tokenizers/punkt')
-        except Exception as e:
-            st.error(f"❌ Failed to download NLTK 'punkt' data: {e}. Sentence tokenization may be suboptimal.")
-            return False
-    return True
-
-nltk_loaded = load_nltk_data()
-
-# --------------- Data Processing Functions ---------------
-def process_uploaded_files(uploaded_files):
-    file_data, locations_from_csv = [], {}
-    for uploaded_file in uploaded_files:
-        try:
-            file_name = uploaded_file.name
-            file_path = os.path.join(DOCUMENTS_DIR, file_name)
-            with open(file_path, "wb") as f: f.write(uploaded_file.getbuffer())
-            text = ""
-            if file_path.lower().endswith('.pdf'):
-                reader = PdfReader(file_path)
-                text = "".join(page.extract_text() + "\n" for page in reader.pages if page.extract_text())
-            elif file_path.lower().endswith('.txt'):
-                text = uploaded_file.read().decode("utf-8")
-            if text: file_data.append({'text': text, 'source': file_name})
-            if file_path.lower().endswith('.csv'):
-                df = pd.read_csv(file_path)
-                df.columns = [col.lower().strip() for col in df.columns]
-                name_col = next((c for c in ['name', 'location', 'place'] if c in df.columns), None)
-                lat_col = next((c for c in ['lat', 'latitude', 'y'] if c in df.columns), None)
-                lon_col = next((c for c in ['lon', 'longitude', 'x'] if c in df.columns), None)
-                desc_col = next((c for c in ['description', 'desc', 'details'] if c in df.columns), 'name')
-                if name_col and lat_col and lon_col:
-                    for _, row in df.iterrows():
-                        try:
-                            name, lat, lon = str(row[name_col]).strip().lower(), float(row[lat_col]), float(row[lon_col])
-                            desc = str(row.get(desc_col, f"Location: {name}"))
-                            if name and -90 <= lat <= 90 and -180 <= lon <= 180:
-                                locations_from_csv[name] = {'name': name, 'lat': lat, 'lon': lon, 'desc': desc}
-                        except (ValueError, TypeError): continue
-        except Exception as e: st.error(f"❌ Error processing {uploaded_file.name}: {e}")
-    return file_data, locations_from_csv
-
-def extract_sentences(text_data):
-    all_sentences = []
-    for data in text_data:
-        text, source = data['text'], data['source']
-        if not text: continue
-        sentences = nltk.sent_tokenize(text) if nltk_loaded else re.split(r'(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?)\s', text)
-        for s in sentences:
-            s_clean = s.strip()
-            if len(s_clean) > 25: all_sentences.append({'sentence': s_clean, 'source': source})
-    return all_sentences
-
-def extract_locations_from_text(text):
-    patterns = [r'([\w\s]{3,50}?)\s*-\s*Lat:\s*([-+]?\d{1,3}\.?\d+),?\s*Lon:\s*([-+]?\d{1,3}\.?\d+)', r'([\w\s]{3,50}?)\s+Latitude:\s*([-+]?\d{1,3}\.?\d+),?\s*Longitude:\s*([-+]?\d{1,3}\.?\d+)', r'([\w\s]{3,50}?)\s*\(\s*([-+]?\d{1,3}\.?\d+),\s*([-+]?\d{1,3}\.?\d+)\s*\)']
-    locations = {}
-    for pattern in patterns:
-        for match in re.finditer(pattern, text, re.IGNORECASE):
-            try:
-                name, lat, lon = match.groups()
-                name = name.strip().lower()
-                if name not in locations: locations[name] = {'name': name, 'lat': float(lat), 'lon': float(lon), 'desc': f"Found in document at {lat}, {lon}."}
-            except (ValueError, IndexError): continue
-    return locations
-
-def build_and_save_data(corpus, locations):
-    saved_sentences, saved_locations = 0, 0
-    try:
-        if corpus and embed_model:
-            embeddings = embed_model.encode([item['sentence'] for item in corpus], show_progress_bar=True)
-            index = faiss.IndexFlatL2(embeddings.shape[1]); index.add(np.array(embeddings, dtype="float32"))
-            faiss.write_index(index, FAISS_INDEX_PATH)
-            with open(CORPUS_PATH, "wb") as f: pickle.dump(corpus, f)
-            saved_sentences = len(corpus)
-        else:
-            if os.path.exists(FAISS_INDEX_PATH): os.remove(FAISS_INDEX_PATH)
-            if os.path.exists(CORPUS_PATH): os.remove(CORPUS_PATH)
-        if locations:
-            with open(LOCATION_DATA_PATH, "wb") as f: pickle.dump(locations, f)
-            saved_locations = len(locations)
-        else:
-            if os.path.exists(LOCATION_DATA_PATH): os.remove(LOCATION_DATA_PATH)
-        return True, saved_sentences, saved_locations
-    except Exception as e:
-        st.error(f"❌ Error building/saving data: {e}")
-        return False, 0, 0
-
-def load_system_data():
-    index, corpus, location_map = None, [], {}
-    try:
-        if os.path.exists(FAISS_INDEX_PATH) and os.path.exists(CORPUS_PATH):
-            index = faiss.read_index(FAISS_INDEX_PATH)
-            with open(CORPUS_PATH, "rb") as f: corpus = pickle.load(f)
-        if os.path.exists(LOCATION_DATA_PATH):
-            with open(LOCATION_DATA_PATH, "rb") as f: location_map = pickle.load(f)
-    except Exception as e:
-        st.error(f"⚠️ Error loading system data: {e}"); return None, [], {}
-    return index, corpus, location_map
-
-# --------------- RAG & Chat Functions ---------------
-def retrieve_chunks(query, corpus, index, top_k=5):
-    if not all([query, corpus, index, embed_model]): return []
-    try:
-        query_embedding = embed_model.encode([query])
-        _, I = index.search(np.array(query_embedding, dtype="float32"), top_k)
-        return [corpus[i] for i in I[0] if i < len(corpus)]
-    except Exception as e:
-        st.warning(f"⚠️ Retrieval error: {e}"); return []
-
-def match_locations(query, location_map):
-    if not location_map: return []
-    query_lower, found = query.lower(), []
-    for name, loc in location_map.items():
-        if name in query_lower: found.append(loc)
-    if not found:
-        query_words = re.findall(r'\b\w+\b', query_lower)
-        for word in query_words:
-            matches = get_close_matches(word, list(location_map.keys()), n=1, cutoff=0.8)
-            if matches: found.append(location_map[matches[0]])
-    return list({loc['name']: loc for loc in found}.values())
-
-def compute_distance_info(locations):
-    if len(locations) == 2:
-        try:
-            coord1, coord2 = (locations[0]["lat"], locations[0]["lon"]), (locations[1]["lat"], locations[1]["lon"])
-            dist = geodesic(coord1, coord2)
-            unit, val = ("km", f"{dist.kilometers:.2f}") if dist.kilometers >= 1 else ("meters", f"{dist.meters:.0f}")
-            return f"The distance between {locations[0]['name'].title()} and {locations[1]['name'].title()} is approximately {val} {unit}."
-        except: return ""
-    return ""
-
-def ask_chatbot(query, context_chunks, geo_context, distance_info):
-    if not client: return "The AI assistant is currently offline."
-    try:
-        lang_code = detect(query)
-        lang_map = {'en': 'English', 'ur': 'Urdu', 'hi': 'Hindi'}
-        language = lang_map.get(lang_code, 'English')
-    except LangDetectException: language = "English"
-
-    context = "\n".join([chunk['sentence'] for chunk in context_chunks])
-    system_prompt = "You are CampusGPT, a helpful campus assistant. Answer concisely and conversationally using the provided information. When you mention a specific location, include its coordinates like '(Lat: 34.05, Lon: -118.24)'. Use the context from documents to answer the user's question."
-    prompt = f"""{system_prompt}
-    ---
-    CONTEXT FROM DOCUMENTS: {context if context else 'No relevant information was found in the documents.'}
-    ---
-    IDENTIFIED LOCATIONS: {geo_context if geo_context else 'No specific locations were mentioned or identified.'}
-    ---
-    CALCULATED DISTANCE: {distance_info if distance_info else 'Not applicable.'}
-    ---
-    USER'S QUESTION: {query}
-    ---
-    YOUR CONVERSATIONAL ANSWER (IN {language.upper()}):"""
-    try:
-        response = client.chat.completions.create(model="llama3-8b-8192", messages=[{"role": "user", "content": prompt}], temperature=0.6, max_tokens=1024)
-        return response.choices[0].message.content
-    except Exception as e: return f"I apologize, but I encountered an error: {e}"
-
-# --------------- UI Components ---------------
-def create_map(locations):
-    if not locations: return None
-    try:
-        map_center = [np.mean([loc['lat'] for loc in locations]), np.mean([loc['lon'] for loc in locations])]
-        m = folium.Map(location=map_center, zoom_start=16, tiles='CartoDB positron', attr='CampusGPT Map')
-        for loc in locations:
-            maps_url = f"https://www.google.com/maps/search/?api=1&query={loc['lat']},{loc['lon']}"
-            popup_html = f"""<div style="width: 220px; font-family: 'Inter', sans-serif;">
-                <h4 style="margin-bottom: 10px; color: #1e293b;">{loc['name'].title()}</h4>
-                <p style="margin-bottom: 12px; color: #475569;">{loc.get('desc', '')[:100]}...</p>
-                <a href="{maps_url}" target="_blank" style="background-color: #4f46e5; color: white; padding: 8px 12px; text-decoration: none; border-radius: 5px; display: inline-block; font-size: 14px; font-weight: 600;">Navigate</a>
-            </div>"""
-            folium.Marker([loc['lat'], loc['lon']], 
-                         popup=folium.Popup(popup_html, max_width=270), 
-                         tooltip=loc['name'].title(), 
-                         icon=folium.Icon(color="darkblue", icon="location-arrow", prefix="fa")).add_to(m)
-        return m
-    except Exception as e:
-        st.error(f"🗺️ Map creation failed: {e}"); return None
-
-def display_welcome_message():
-    st.markdown("""
-    <div style="background: linear-gradient(135deg, #f5f7fa 0%, #e4e8f0 100%); 
-                border-radius: 12px; 
-                padding: 2rem; 
-                margin: 2rem 0;
-                box-shadow: 0 4px 6px rgba(0,0,0,0.05);">
-        <h2 style="color: #4f46e5; margin-bottom: 1rem;">👋 Welcome to CampusGPT!</h2>
-        <p style="color: #4b5563; font-size: 1.1rem; margin-bottom: 1.5rem;">
-            Your intelligent campus assistant is ready to help, but first we need some information to get started.
-        </p>
-        <div style="background-color: white; border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem;">
-            <h4 style="color: #4f46e5; margin-bottom: 1rem;">📌 Admin Instructions:</h4>
-            <ol style="color: #4b5563; padding-left: 1.5rem;">
-                <li style="margin-bottom: 0.5rem;">Select <b style="color: #4f46e5;">Admin</b> in the sidebar and enter the password.</li>
-                <li style="margin-bottom: 0.5rem;">Upload PDF, TXT, or CSV files containing campus information.</li>
-                <li>Click <b style="color: #4f46e5;">'Process & Build Index'</b> to make the data searchable.</li>
-            </ol>
-        </div>
-        <p style="color: #6b7280; font-size: 0.9rem;">
-            Once the documents are processed, you can ask questions about campus locations, distances, and general information.
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
-
-# --------------- Main Streamlit App ---------------
+# Page configuration
 st.set_page_config(
-    page_title="CampusGPT", 
-    page_icon="🏫", 
+    page_title="Campus Information Assistant",
+    page_icon="🏫",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for elegant UI
-st.markdown("""
-<style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-    
-    /* Base styles */
-    html, body, [class*="st-"] {
-        font-family: 'Inter', sans-serif;
-    }
-    
-    /* Main container adjustments */
-    .block-container {
-        padding-top: 2rem;
-        padding-bottom: 2rem;
-        max-width: 1200px;
-    }
-    
-    /* Sidebar styling */
-    [data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #4f46e5 0%, #7c3aed 100%);
-        color: white;
-        padding: 1.5rem 1rem;
-    }
-    
-    [data-testid="stSidebar"] .stRadio > div {
-        flex-direction: row;
-        gap: 0.5rem;
-    }
-    
-    [data-testid="stSidebar"] .stRadio label {
-        color: white !important;
-        font-weight: 500;
-    }
-    
-    [data-testid="stSidebar"] .stButton button {
-        background-color: white;
-        color: #4f46e5;
-        border: none;
-        border-radius: 8px;
-        padding: 0.5rem 1rem;
-        font-weight: 600;
-        width: 100%;
-        transition: all 0.2s ease;
-    }
-    
-    [data-testid="stSidebar"] .stButton button:hover {
-        background-color: #f0f0f0;
-        transform: translateY(-1px);
-    }
-    
-    /* Chat message styling */
-    .chat-message {
-        display: flex;
-        margin-bottom: 1.5rem;
-        max-width: 85%;
-    }
-    
-    .user-message {
-        justify-content: flex-end;
-        margin-left: auto;
-    }
-    
-    .assistant-message {
-        justify-content: flex-start;
-    }
-    
-    .chat-bubble {
-        padding: 1rem 1.25rem;
-        border-radius: 12px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-        line-height: 1.6;
-        word-wrap: break-word;
-        max-width: 90%;
-    }
-    
-    .user-message .chat-bubble {
-        background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
-        color: white;
-        border-bottom-right-radius: 4px;
-    }
-    
-    .assistant-message .chat-bubble {
-        background-color: #f9fafb;
-        color: #111827;
-        border-bottom-left-radius: 4px;
-        border: 1px solid #e5e7eb;
-    }
-    
-    .assistant-message .chat-bubble a {
-        color: #4f46e5;
-        font-weight: 500;
-        text-decoration: none;
-    }
-    
-    .assistant-message .chat-bubble a:hover {
-        text-decoration: underline;
-    }
-    
-    .chat-icon {
-        font-size: 1.5rem;
-        margin-right: 0.75rem;
-        margin-top: 0.25rem;
-        align-self: flex-start;
-    }
-    
-    /* Input box styling */
-    [data-testid="stChatInput"] textarea {
-        border-radius: 12px !important;
-        padding: 1rem !important;
-        border: 1px solid #e5e7eb !important;
-    }
-    
-    [data-testid="stChatInput"] button {
-        background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%) !important;
-        border: none !important;
-    }
-    
-    /* Header styling */
-    .main-header {
-        text-align: center;
-        margin-bottom: 2rem;
-    }
-    
-    .main-header h1 {
-        font-size: 2.5rem;
-        font-weight: 700;
-        background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        margin-bottom: 0.5rem;
-    }
-    
-    .main-header p {
-        color: #6b7280;
-        font-size: 1.1rem;
-    }
-    
-    /* Admin panel styling */
-    .admin-card {
-        background-color: white;
-        border-radius: 12px;
-        padding: 1.5rem;
-        margin-bottom: 1.5rem;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.05);
-        border-left: 4px solid #4f46e5;
-    }
-    
-    /* Status indicators */
-    .status-ready {
-        color: #10b981;
-        font-weight: 600;
-    }
-    
-    .status-not-ready {
-        color: #ef4444;
-        font-weight: 600;
-    }
-    
-    /* Danger zone styling */
-    .danger-zone {
-        border: 1px solid #fecaca;
-        background-color: #fef2f2;
-        border-radius: 12px;
-        padding: 1.5rem;
-        margin-top: 1.5rem;
-    }
-    
-    /* Button styling */
-    .stButton button {
-        transition: all 0.2s ease;
-    }
-    
-    .stButton button:hover {
-        transform: translateY(-1px);
-    }
-    
-    /* Tab styling */
-    [data-testid="stTabs"] {
-        margin-top: 1rem;
-    }
-    
-    [role="tablist"] button {
-        padding: 0.5rem 1rem !important;
-    }
-    
-    /* Footer styling */
-    .footer {
-        text-align: center;
-        color: #9ca3af;
-        font-size: 0.8rem;
-        margin-top: 2rem;
-        padding-top: 1rem;
-        border-top: 1px solid #e5e7eb;
-    }
-</style>
-""", unsafe_allow_html=True)
-
 # Initialize session state
-if "chat_history" not in st.session_state:
+if 'knowledge_base' not in st.session_state:
+    st.session_state.knowledge_base = []
+if 'location_data' not in st.session_state:
+    st.session_state.location_data = []
+if 'faiss_index' not in st.session_state:
+    st.session_state.faiss_index = None
+if 'model' not in st.session_state:
+    st.session_state.model = None
+if 'multilingual_model' not in st.session_state:
+    st.session_state.multilingual_model = None
+if 'chat_history' not in st.session_state:
     st.session_state.chat_history = []
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-if 'confirm_delete' not in st.session_state:
-    st.session_state.confirm_delete = False
 
-# Load system data
-index, corpus, location_map = load_system_data()
-system_ready = (index is not None and corpus) or bool(location_map)
+# Load models (cached)
+@st.cache_resource
+def load_models():
+    """Load sentence transformer models"""
+    try:
+        model = SentenceTransformer('sentence-transformers/all-mpnet-base-v2')
+        multilingual_model = SentenceTransformer('sentence-transformers/LaBSE')
+        return model, multilingual_model
+    except Exception as e:
+        st.error(f"Error loading models: {str(e)}")
+        return None, None
 
-# Sidebar
-with st.sidebar:
-    st.markdown("""
-    <div style="text-align: center; margin-bottom: 2rem;">
-        <h1 style="color: white; font-size: 1.8rem; margin-bottom: 0.5rem;">🏫 CampusGPT</h1>
-        <p style="color: #e0e7ff; font-size: 0.9rem;">Your Smart Campus Assistant</p>
-    </div>
-    """, unsafe_allow_html=True)
+def extract_text_from_pdf(pdf_file) -> str:
+    """Extract text from PDF file"""
+    try:
+        pdf_reader = PyPDF2.PdfReader(pdf_file)
+        text = ""
+        for page in pdf_reader.pages:
+            text += page.extract_text() + "\n"
+        return text
+    except Exception as e:
+        st.error(f"Error extracting text from PDF: {str(e)}")
+        return ""
+
+def extract_tables_from_pdf(pdf_file) -> List[pd.DataFrame]:
+    """Extract tables from PDF (basic implementation)"""
+    # Note: For production use, consider using tabula-py or pdfplumber
+    # This is a simplified version
+    try:
+        text = extract_text_from_pdf(pdf_file)
+        # Basic table detection - look for tabular patterns
+        lines = text.split('\n')
+        tables = []
+        
+        for line in lines:
+            # Simple heuristic: if line has multiple numbers/coordinates
+            if re.search(r'\d+\.\d+.*\d+\.\d+', line):
+                # Try to parse as location data
+                parts = line.split()
+                if len(parts) >= 4:
+                    try:
+                        # Attempt to extract location info
+                        name = ' '.join(parts[:-3])
+                        lat = float(parts[-3])
+                        lon = float(parts[-2])
+                        desc = parts[-1] if len(parts) > 3 else ""
+                        
+                        df = pd.DataFrame({
+                            'name': [name],
+                            'latitude': [lat],
+                            'longitude': [lon],
+                            'description': [desc]
+                        })
+                        tables.append(df)
+                    except:
+                        continue
+        
+        return tables
+    except Exception as e:
+        st.error(f"Error extracting tables from PDF: {str(e)}")
+        return []
+
+def process_text_to_sentences(text: str) -> List[str]:
+    """Split text into sentences for RAG"""
+    # Simple sentence splitting
+    sentences = re.split(r'[.!?]+', text)
+    sentences = [s.strip() for s in sentences if s.strip() and len(s.strip()) > 20]
+    return sentences
+
+def process_location_data(df: pd.DataFrame) -> List[Dict]:
+    """Process DataFrame to extract location information"""
+    locations = []
     
-    st.markdown("---")
+    # Common column name variations
+    name_cols = ['name', 'location', 'place', 'building', 'facility']
+    lat_cols = ['latitude', 'lat', 'y']
+    lon_cols = ['longitude', 'lon', 'lng', 'x']
+    desc_cols = ['description', 'desc', 'info', 'details']
     
-    # Role selection
-    role = st.radio(
-        "Select Your Role",
-        ["👤 User", "🔧 Admin"],
-        horizontal=True,
-        label_visibility="collapsed"
+    # Find the correct columns
+    df_lower = df.columns.str.lower()
+    
+    name_col = next((col for col in df.columns if df_lower[df.columns.get_loc(col)] in name_cols), None)
+    lat_col = next((col for col in df.columns if df_lower[df.columns.get_loc(col)] in lat_cols), None)
+    lon_col = next((col for col in df.columns if df_lower[df.columns.get_loc(col)] in lon_cols), None)
+    desc_col = next((col for col in df.columns if df_lower[df.columns.get_loc(col)] in desc_cols), None)
+    
+    if name_col and lat_col and lon_col:
+        for _, row in df.iterrows():
+            try:
+                location = {
+                    'name': str(row[name_col]),
+                    'latitude': float(row[lat_col]),
+                    'longitude': float(row[lon_col]),
+                    'description': str(row[desc_col]) if desc_col else ""
+                }
+                locations.append(location)
+            except (ValueError, TypeError):
+                continue
+    
+    return locations
+
+def create_faiss_index(texts: List[str], model) -> faiss.IndexFlatIP:
+    """Create FAISS index for text embeddings"""
+    if not texts or not model:
+        return None
+    
+    try:
+        embeddings = model.encode(texts, convert_to_tensor=False)
+        embeddings = np.array(embeddings).astype('float32')
+        
+        # Normalize embeddings for cosine similarity
+        faiss.normalize_L2(embeddings)
+        
+        # Create FAISS index
+        index = faiss.IndexFlatIP(embeddings.shape[1])
+        index.add(embeddings)
+        
+        return index
+    except Exception as e:
+        st.error(f"Error creating FAISS index: {str(e)}")
+        return None
+
+def search_knowledge_base(query: str, index, knowledge_base: List[str], model, k: int = 3) -> List[str]:
+    """Search knowledge base using FAISS"""
+    if not index or not knowledge_base or not model:
+        return []
+    
+    try:
+        query_embedding = model.encode([query], convert_to_tensor=False)
+        query_embedding = np.array(query_embedding).astype('float32')
+        faiss.normalize_L2(query_embedding)
+        
+        scores, indices = index.search(query_embedding, k)
+        
+        results = []
+        for idx in indices[0]:
+            if idx < len(knowledge_base):
+                results.append(knowledge_base[idx])
+        
+        return results
+    except Exception as e:
+        st.error(f"Error searching knowledge base: {str(e)}")
+        return []
+
+def find_location_in_query(query: str, locations: List[Dict]) -> Optional[Dict]:
+    """Find if query mentions any known location"""
+    query_lower = query.lower()
+    
+    for location in locations:
+        if location['name'].lower() in query_lower:
+            return location
+    
+    return None
+
+def generate_answer_with_groq(query: str, context: List[str], groq_api_key: str) -> str:
+    """Generate answer using Groq API"""
+    if not groq_api_key:
+        return "Please configure Groq API key in the sidebar to get AI-generated responses."
+    
+    try:
+        client = Groq(api_key=groq_api_key)
+        
+        context_text = "\n".join(context) if context else "No relevant context found."
+        
+        prompt = f"""Based on the following context, please answer the user's question. If the context doesn't contain relevant information, please say so.
+
+Context:
+{context_text}
+
+Question: {query}
+
+Answer:"""
+
+        response = client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model="llama-3.1-8b-instant",
+            max_tokens=500,
+            temperature=0.7
+        )
+        
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"Error generating response: {str(e)}"
+
+def admin_page():
+    """Admin page for file upload and processing"""
+    st.title("🔧 Admin Dashboard")
+    st.markdown("Upload and process files to build the knowledge base")
+    
+    # File uploader
+    uploaded_files = st.file_uploader(
+        "Upload files (PDF, CSV, XLSX, XLS)",
+        type=['pdf', 'csv', 'xlsx', 'xls'],
+        accept_multiple_files=True
     )
     
-    st.markdown("---")
-    
-    # Clear chat button
-    if st.button("🗑️ Clear Chat History", key="clear_chat"):
-        st.session_state.chat_history = []
-        st.toast("Chat history cleared!", icon="🔄")
-        st.rerun()
-    
-    st.markdown("---")
-    
-    # Footer
-    st.markdown("""
-    <div class="footer">
-        Made with ❤️ by Zubair Yamin Suhaib
-    </div>
-    """, unsafe_allow_html=True)
-
-# Main content
-st.markdown("""
-<div class="main-header">
-    <h1>CampusGPT</h1>
-    <p>Your Intelligent Campus Assistant</p>
-</div>
-""", unsafe_allow_html=True)
-
-if not client and role == "👤 User":
-    st.error("""
-    <div style="background-color: #fef2f2; color: #b91c1c; padding: 1rem; border-radius: 8px; border-left: 4px solid #dc2626;">
-        <p style="margin: 0; font-weight: 500;">🔴 The AI Assistant is not configured. An administrator must set the GROQ_API_KEY in the Streamlit secrets.</p>
-    </div>
-    """, unsafe_allow_html=True)
-    st.stop()
-
-if role == "🔧 Admin":
-    if not st.session_state.authenticated:
-        st.subheader("🔐 Admin Login")
-        password = st.text_input("Enter Password", type="password", key="admin_pass")
-        if st.button("🔑 Login", type="primary"):
-            if password == ADMIN_PASSWORD:
-                st.session_state.authenticated = True
-                st.rerun()
-            else:
-                st.error("❌ Incorrect password.")
-    else:
-        st.subheader("⚙️ Admin Control Panel")
-        tab1, tab2, tab3 = st.tabs(["📤 Upload & Process", "ℹ️ System Info", "📋 CSV Guide"])
+    if uploaded_files:
+        st.subheader("Processing Files")
         
-        with tab1:
-            st.markdown("""
-            <div class="admin-card">
-                <h3 style="color: #4f46e5; margin-bottom: 1rem;">Upload Campus Documents</h3>
-                <p style="color: #6b7280; margin-bottom: 1.5rem;">
-                    Upload PDF or TXT files for general campus information, and CSV files for location data.
-                    The system will extract text and location information to build a searchable knowledge base.
-                </p>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            uploaded_files = st.file_uploader(
-                "Choose files",
-                type=['pdf', 'txt', 'csv'],
-                accept_multiple_files=True,
-                label_visibility="collapsed"
-            )
-            
-            if st.button("🔄 Process & Build Index", type="primary"):
-                if uploaded_files:
-                    with st.spinner("Processing files... This may take a few moments depending on file size."):
-                        file_data, csv_locs = process_uploaded_files(uploaded_files)
-                        full_text = " ".join([d['text'] for d in file_data])
-                        text_locs = extract_locations_from_text(full_text)
-                        all_locations = {**csv_locs, **text_locs}
-                        corpus_sentences = extract_sentences(file_data)
-                        success, num_sentences, num_locations = build_and_save_data(corpus_sentences, all_locations)
-                        
-                        if success:
-                            if num_sentences > 0 or num_locations > 0:
-                                st.success(f"""
-                                <div style="background-color: #ecfdf5; color: #065f46; padding: 1rem; border-radius: 8px; border-left: 4px solid #10b981;">
-                                    <p style="margin: 0; font-weight: 500;">✅ Processing complete!</p>
-                                    <p style="margin: 0.5rem 0 0 0;">Saved {num_sentences} sentences and {num_locations} locations.</p>
-                                </div>
-                                """, unsafe_allow_html=True)
-                                st.balloons()
-                            else:
-                                st.warning("""
-                                <div style="background-color: #fffbeb; color: #92400e; padding: 1rem; border-radius: 8px; border-left: 4px solid #f59e0b;">
-                                    <p style="margin: 0; font-weight: 500;">⚠️ No processable data found in the files.</p>
-                                    <p style="margin: 0.5rem 0 0 0;">Please ensure your files contain text or properly formatted location data.</p>
-                                </div>
-                                """, unsafe_allow_html=True)
-                else:
-                    st.warning("""
-                    <div style="background-color: #fffbeb; color: #92400e; padding: 1rem; border-radius: 8px; border-left: 4px solid #f59e0b;">
-                        <p style="margin: 0; font-weight: 500;">Please upload at least one file.</p>
-                    </div>
-                    """, unsafe_allow_html=True)
+        progress_bar = st.progress(0)
+        status_text = st.empty()
         
-        with tab2:
-            st.markdown("""
-            <div class="admin-card">
-                <h3 style="color: #4f46e5; margin-bottom: 1rem;">System Status</h3>
-                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 1.5rem;">
-                    <div style="background-color: #f9fafb; border-radius: 8px; padding: 1rem; border: 1px solid #e5e7eb;">
-                        <p style="color: #6b7280; margin: 0 0 0.5rem 0; font-size: 0.9rem;">System Status</p>
-                        <p style="color: #4f46e5; margin: 0; font-size: 1.2rem; font-weight: 600;">{'<span class="status-ready">✅ Ready</span>' if system_ready else '<span class="status-not-ready">❌ Not Ready</span>'}</p>
-                    </div>
-                    <div style="background-color: #f9fafb; border-radius: 8px; padding: 1rem; border: 1px solid #e5e7eb;">
-                        <p style="color: #6b7280; margin: 0 0 0.5rem 0; font-size: 0.9rem;">Indexed Sentences</p>
-                        <p style="color: #4f46e5; margin: 0; font-size: 1.2rem; font-weight: 600;">{len(corpus) if corpus else 0}</p>
-                    </div>
-                    <div style="background-color: #f9fafb; border-radius: 8px; padding: 1rem; border: 1px solid #e5e7eb;">
-                        <p style="color: #6b7280; margin: 0 0 0.5rem 0; font-size: 0.9rem;">Known Locations</p>
-                        <p style="color: #4f46e5; margin: 0; font-size: 1.2rem; font-weight: 600;">{len(location_map) if location_map else 0}</p>
-                    </div>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
+        all_texts = []
+        all_locations = []
+        
+        for i, file in enumerate(uploaded_files):
+            status_text.text(f"Processing {file.name}...")
             
-            with st.expander("📍 View Available Locations", expanded=False):
-                if location_map:
-                    st.markdown("""
-                    <div style="background-color: #f9fafb; border-radius: 8px; padding: 1rem; border: 1px solid #e5e7eb; max-height: 300px; overflow-y: auto;">
-                        <ul style="margin: 0; padding-left: 1.25rem;">
-                    """, unsafe_allow_html=True)
-                    for name in sorted(location_map.keys()):
-                        st.markdown(f"<li style='margin-bottom: 0.25rem;'>{name.title()}</li>", unsafe_allow_html=True)
-                    st.markdown("</ul></div>", unsafe_allow_html=True)
-                else:
-                    st.markdown("""
-                    <div style="background-color: #f9fafb; border-radius: 8px; padding: 1rem; border: 1px solid #e5e7eb; text-align: center;">
-                        <p style="color: #6b7280; margin: 0;">No locations loaded.</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-            
-            st.markdown("""
-            <div class="danger-zone">
-                <h3 style="color: #dc2626; margin-bottom: 1rem;">🚨 Danger Zone</h3>
-                <p style="color: #6b7280; margin-bottom: 1rem;">
-                    These actions are irreversible. Proceed with caution.
-                </p>
-                {button_html}
-            </div>
-            """.format(
-                button_html="""
-                <button onclick="document.getElementById('confirm-delete').style.display='block'" style="background-color: #ef4444; color: white; border: none; border-radius: 8px; padding: 0.5rem 1rem; font-weight: 600; cursor: pointer;">
-                    🗑️ Clear All Data & Index
-                </button>
-                """ if not st.session_state.confirm_delete else """
-                <div style="background-color: #fee2e2; border-radius: 8px; padding: 1rem; margin-bottom: 1rem;">
-                    <p style="color: #b91c1c; font-weight: 600; margin-bottom: 1rem;">Are you sure? This will delete all processed data.</p>
-                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
-                        <button onclick="document.getElementById('confirm-delete').style.display='none'" style="background-color: #ef4444; color: white; border: none; border-radius: 8px; padding: 0.5rem; font-weight: 600; cursor: pointer; width: 100%;">
-                            Yes, delete everything
-                        </button>
-                        <button onclick="document.getElementById('confirm-delete').style.display='none'" style="background-color: #e5e7eb; color: #111827; border: none; border-radius: 8px; padding: 0.5rem; font-weight: 600; cursor: pointer; width: 100%;">
-                            Cancel
-                        </button>
-                    </div>
-                </div>
-                """
-            ), unsafe_allow_html=True)
-            
-            if st.session_state.confirm_delete:
-                if st.button("Yes, I am sure, delete everything.", type="primary"):
-                    try:
-                        if os.path.exists(STORAGE_DIR):
-                            shutil.rmtree(STORAGE_DIR)
-                        if os.path.exists(DOCUMENTS_DIR):
-                            shutil.rmtree(DOCUMENTS_DIR)
-                        os.makedirs(DOCUMENTS_DIR, exist_ok=True)
-                        os.makedirs(STORAGE_DIR, exist_ok=True)
-                        st.session_state.confirm_delete = False
-                        st.success("""
-                        <div style="background-color: #ecfdf5; color: #065f46; padding: 1rem; border-radius: 8px; border-left: 4px solid #10b981;">
-                            <p style="margin: 0; font-weight: 500;">All system data has been cleared.</p>
-                        </div>
-                        """, unsafe_allow_html=True)
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"""
-                        <div style="background-color: #fef2f2; color: #b91c1c; padding: 1rem; border-radius: 8px; border-left: 4px solid #dc2626;">
-                            <p style="margin: 0; font-weight: 500;">Failed to clear data: {e}</p>
-                        </div>
-                        """, unsafe_allow_html=True)
+            try:
+                if file.type == "application/pdf":
+                    # Process PDF
+                    text = extract_text_from_pdf(file)
+                    if text:
+                        sentences = process_text_to_sentences(text)
+                        all_texts.extend(sentences)
+                        st.success(f"Extracted {len(sentences)} sentences from {file.name}")
+                    
+                    # Try to extract tables from PDF
+                    tables = extract_tables_from_pdf(file)
+                    for table in tables:
+                        locations = process_location_data(table)
+                        all_locations.extend(locations)
                 
-                if st.button("Cancel"):
-                    st.session_state.confirm_delete = False
-                    st.rerun()
+                elif file.type in ["text/csv", "application/vnd.ms-excel", 
+                                   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"]:
+                    # Process CSV/Excel
+                    if file.name.endswith('.csv'):
+                        df = pd.read_csv(file)
+                    else:
+                        df = pd.read_excel(file)
+                    
+                    st.dataframe(df.head())
+                    
+                    # Try to extract locations
+                    locations = process_location_data(df)
+                    all_locations.extend(locations)
+                    
+                    if locations:
+                        st.success(f"Extracted {len(locations)} locations from {file.name}")
+                    
+                    # Also process as text for RAG
+                    text_data = df.to_string()
+                    sentences = process_text_to_sentences(text_data)
+                    all_texts.extend(sentences)
+            
+            except Exception as e:
+                st.error(f"Error processing {file.name}: {str(e)}")
+            
+            progress_bar.progress((i + 1) / len(uploaded_files))
         
-        with tab3:
-            st.markdown("""
-            <div class="admin-card">
-                <h3 style="color: #4f46e5; margin-bottom: 1rem;">CSV File Format Guide</h3>
-                <p style="color: #6b7280; margin-bottom: 1.5rem;">
-                    Your CSV file should contain columns for location names, latitude, and longitude. 
-                    A description column is optional but recommended for better context.
-                </p>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            sample_df = pd.DataFrame({
-                'name': ['Central Library', 'Student Center'], 
-                'latitude': [34.0522, 34.0518], 
-                'longitude': [-118.2437, -118.2434], 
-                'description': ['Main campus library with study spaces.', 'Hub for student activities and dining.']
-            })
-            
-            st.dataframe(
-                sample_df.style
-                    .set_properties(**{'background-color': '#f9fafb', 'color': '#111827', 'border': '1px solid #e5e7eb'})
-                    .highlight_max(color='#dbeafe')
-                    .highlight_min(color='#fee2e2'),
-                use_container_width=True
+        # Update session state
+        if all_texts:
+            st.session_state.knowledge_base.extend(all_texts)
+            st.success(f"Added {len(all_texts)} text segments to knowledge base")
+        
+        if all_locations:
+            st.session_state.location_data.extend(all_locations)
+            st.success(f"Added {len(all_locations)} locations to database")
+        
+        # Create/update FAISS index
+        if st.session_state.knowledge_base and st.session_state.model:
+            status_text.text("Creating search index...")
+            st.session_state.faiss_index = create_faiss_index(
+                st.session_state.knowledge_base, 
+                st.session_state.model
             )
-            
-            st.download_button(
-                "⬇️ Download CSV Template",
-                sample_df.to_csv(index=False).encode('utf-8'),
-                "locations_template.csv",
-                "text/csv",
-                help="Download a template CSV file to get started with location data"
-            )
-
-else:  # User View
-    if not system_ready:
-        display_welcome_message()
-    else:
-        # Display chat history
-        for i, msg in enumerate(st.session_state.chat_history):
-            is_user = msg["role"] == "user"
-            
-            st.markdown(f"""
-            <div class="chat-message {'user-message' if is_user else 'assistant-message'}">
-                <div class="chat-icon">{'👤' if is_user else '🏫'}</div>
-                <div class="chat-bubble">
-                    {msg["content"]}
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            # Display map if locations are found
-            if not is_user and "locations" in msg and msg["locations"]:
-                map_obj = create_map(msg["locations"])
-                if map_obj:
-                    st_folium(
-                        map_obj, 
-                        width=800, 
-                        height=400, 
-                        key=f"map_{i}",
-                        returned_objects=[]
-                    )
-
-        # Chat input
-        if prompt := st.chat_input("Ask about campus locations, distances, or general info..."):
-            st.session_state.chat_history.append({"role": "user", "content": prompt})
+            if st.session_state.faiss_index:
+                st.success("Search index created successfully!")
+        
+        status_text.text("Processing complete!")
+    
+    # Display current knowledge base stats
+    st.subheader("📊 Knowledge Base Statistics")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.metric("Text Segments", len(st.session_state.knowledge_base))
+        
+    with col2:
+        st.metric("Locations", len(st.session_state.location_data))
+    
+    # Display locations
+    if st.session_state.location_data:
+        st.subheader("📍 Stored Locations")
+        locations_df = pd.DataFrame(st.session_state.location_data)
+        st.dataframe(locations_df)
+        
+        # Clear data button
+        if st.button("🗑️ Clear All Data"):
+            st.session_state.knowledge_base = []
+            st.session_state.location_data = []
+            st.session_state.faiss_index = None
             st.rerun()
 
-        # Generate response to the last user message
-        if st.session_state.chat_history and st.session_state.chat_history[-1]["role"] == "user":
-            with st.spinner("🤔 Thinking..."):
-                last_prompt = st.session_state.chat_history[-1]["content"]
-                chunks = retrieve_chunks(last_prompt, corpus, index)
-                locs = match_locations(last_prompt, location_map)
-                loc_info = "\n".join([f"{l['name'].title()}: (Lat: {l['lat']}, Lon: {l['lon']})" for l in locs])
-                dist_info = compute_distance_info(locs)
-                response = ask_chatbot(last_prompt, chunks, loc_info, dist_info)
-                st.session_state.chat_history.append({
-                    "role": "assistant", 
-                    "content": response, 
-                    "locations": locs
-                })
-                st.rerun()
+def user_page():
+    """User page for chat interface"""
+    st.title("💬 Campus Assistant")
+    st.markdown("Ask questions about the campus or request navigation help!")
+    
+    # Chat interface
+    st.subheader("Chat")
+    
+    # Display chat history
+    chat_container = st.container()
+    
+    with chat_container:
+        for i, (user_msg, bot_msg, location_info) in enumerate(st.session_state.chat_history):
+            with st.chat_message("user"):
+                st.write(user_msg)
+            
+            with st.chat_message("assistant"):
+                st.write(bot_msg)
+                
+                if location_info:
+                    st.subheader(f"📍 {location_info['name']}")
+                    if location_info['description']:
+                        st.write(location_info['description'])
+                    
+                    # Create map
+                    m = folium.Map(
+                        location=[location_info['latitude'], location_info['longitude']], 
+                        zoom_start=16
+                    )
+                    folium.Marker(
+                        [location_info['latitude'], location_info['longitude']],
+                        popup=location_info['name'],
+                        tooltip=location_info['name']
+                    ).add_to(m)
+                    
+                    st_folium(m, height=300, width=700)
+    
+    # Chat input
+    user_input = st.chat_input("Ask me anything about the campus...")
+    
+    if user_input:
+        # Detect language
+        try:
+            detected_lang = detect(user_input)
+            is_english = detected_lang == 'en'
+        except:
+            is_english = True
+        
+        # Choose appropriate model
+        search_model = st.session_state.model if is_english else st.session_state.multilingual_model
+        
+        # Search knowledge base
+        relevant_context = []
+        if st.session_state.faiss_index and search_model:
+            relevant_context = search_knowledge_base(
+                user_input, 
+                st.session_state.faiss_index, 
+                st.session_state.knowledge_base, 
+                search_model
+            )
+        
+        # Check for location mentions
+        location_info = find_location_in_query(user_input, st.session_state.location_data)
+        
+        # Generate response
+        groq_api_key = st.sidebar.text_input("Groq API Key", type="password")
+        response = generate_answer_with_groq(user_input, relevant_context, groq_api_key)
+        
+        # Add to chat history
+        st.session_state.chat_history.append((user_input, response, location_info))
+        
+        st.rerun()
+
+def main():
+    """Main application"""
+    # Load models
+    if st.session_state.model is None:
+        with st.spinner("Loading AI models..."):
+            st.session_state.model, st.session_state.multilingual_model = load_models()
+    
+    # Sidebar navigation
+    st.sidebar.title("🏫 Campus Assistant")
+    page = st.sidebar.selectbox("Select Page", ["User", "Admin"])
+    
+    # API Configuration
+    st.sidebar.subheader("⚙️ Configuration")
+    st.sidebar.markdown("Enter your Groq API key to enable AI responses")
+    
+    # Model status
+    st.sidebar.subheader("🤖 Model Status")
+    if st.session_state.model:
+        st.sidebar.success("✅ English model loaded")
+    else:
+        st.sidebar.error("❌ English model not loaded")
+    
+    if st.session_state.multilingual_model:
+        st.sidebar.success("✅ Multilingual model loaded")
+    else:
+        st.sidebar.error("❌ Multilingual model not loaded")
+    
+    # Data status
+    st.sidebar.subheader("📊 Data Status")
+    st.sidebar.info(f"Knowledge Base: {len(st.session_state.knowledge_base)} items")
+    st.sidebar.info(f"Locations: {len(st.session_state.location_data)} items")
+    
+    # Page routing
+    if page == "Admin":
+        admin_page()
+    else:
+        user_page()
+
+if __name__ == "__main__":
+    main()
