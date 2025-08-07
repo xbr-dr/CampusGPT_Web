@@ -11,3 +11,5 @@ streamlit-folium==0.15.1
 groq==0.3.0
 langdetect==1.0.9
 python-dotenv==1.0.0
+thefuzz==0.22.1
+rapidfuzz==3.13.0
