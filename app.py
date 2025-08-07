@@ -263,7 +263,6 @@ def create_map(locations):
         map_center = [np.mean([loc['lat'] for loc in locations]), np.mean([loc['lon'] for loc in locations])]
         m = folium.Map(location=map_center, zoom_start=16, tiles='CartoDB positron', attr='CampusGPT Map')
         for loc in locations:
-            # IMPROVED: Use a more standard and reliable Google Maps URL
             Maps_url = f"https://www.google.com/maps/search/?api=1&query={loc['lat']},{loc['lon']}"
             popup_html = f"""<div style="width: 220px; font-family: 'Inter', sans-serif;">
                 <h4 style="margin-bottom: 10px; color: #1e293b;">{loc['name'].title()}</h4>
@@ -394,7 +393,7 @@ else:  # User View
             st.markdown(f"""
             <div class="chat-message {'user-message' if is_user else 'assistant-message'}">
                 {'<div class="chat-icon">🏫</div>' if not is_user else ''}
-                <div class="chat-bubble">{msg["content"]}</div>
+                <div class="chat-bubble" style="border-radius: 1.25rem; padding: 1rem 1.25rem; box-shadow: 0 4px 6px rgba(0,0,0,0.05); line-height: 1.6;">{msg["content"]}</div>
                 {'<div class="chat-icon">👤</div>' if is_user else ''}
             </div>""", unsafe_allow_html=True)
             if not is_user and "locations" in msg and msg["locations"]:
