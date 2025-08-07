@@ -19,7 +19,7 @@ from langdetect import detect, LangDetectException
 
 # Version tag to confirm the correct file is running on Streamlit Cloud
 st.info("✅ Running App Version: 2025-08-07-Final-NLTK-Fix")
-
+nltk.download('punkt_tab')
 # --------------- Configuration ---------------
 # Directories for storing data and uploaded documents
 DOCUMENTS_DIR = "data/documents"
