@@ -43,7 +43,7 @@ def load_models_and_groq():
         multi_embed_model = SentenceTransformer("distiluse-base-multilingual-cased-v1")
 
         # Use the provided Groq API key directly
-        api_key = GROQ_API_KEY
+        api_key = "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"
 
         if not api_key:
             return embed_model, multi_embed_model, None
