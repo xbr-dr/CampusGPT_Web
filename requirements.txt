@@ -1,9 +1,13 @@
 streamlit
+faiss-cpu
+nltk
+pandas
+numpy
 PyPDF2
 sentence-transformers
-faiss-cpu
-langdetect
+geopy
 folium
 streamlit-folium
-geopy
 groq
+beautifulsoup4
+requests
