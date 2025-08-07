@@ -9,7 +9,7 @@ streamlit-folium
 groq
 langdetect
 nltk
-faiss-cpu
+faiss-cpu==1.7.4
 thefuzz
 rapidfuzz
 openrouteservice-py
