@@ -15,9 +15,11 @@ from groq import Groq
 import shutil
 from langdetect import detect, LangDetectException
 from thefuzz import process, fuzz
+import openrouteservice
+from streamlit_js_eval import get_geolocation
+
 
 nltk.download('punkt_tab')
-
 
 # --------------- Configuration ---------------
 DOCUMENTS_DIR = "data/documents"
@@ -32,45 +34,50 @@ os.makedirs(STORAGE_DIR, exist_ok=True)
 
 # --------------- Initialization & Caching ---------------
 @st.cache_resource
-def load_models_and_groq():
-    """Load sentence transformer model and initialize Groq client."""
+def load_clients():
+    """Load all models and API clients."""
     try:
         embed_model = SentenceTransformer("distiluse-base-multilingual-cased-v1")
-        api_key = st.secrets.get("GROQ_API_KEY")
-        if not api_key:
-            st.warning("⚠️ Groq API key not found. Please add it to your Streamlit secrets.", icon="🔒")
-            return embed_model, None
-        groq_client = Groq(api_key=api_key)
-        return embed_model, groq_client
-    except Exception as e:
-        st.error(f"❌ Error loading models or initializing Groq: {e}")
-        return None, None
+        
+        groq_api_key = st.secrets.get("GROQ_API_KEY")
+        ors_api_key = st.secrets.get("ORS_API_KEY")
 
-embed_model, client = load_models_and_groq()
+        groq_client = Groq(api_key=groq_api_key) if groq_api_key else None
+        ors_client = openrouteservice.Client(key=ors_api_key) if ors_api_key else None
+        
+        if not groq_client: st.warning("⚠️ Groq API key not found. AI chat will be disabled.", icon="🔒")
+        if not ors_client: st.warning("⚠️ OpenRouteService API key not found. Navigation will be disabled.", icon="🗺️")
+
+        return embed_model, groq_client, ors_client
+    except Exception as e:
+        st.error(f"❌ Error loading models or clients: {e}")
+        return None, None, None
+
+embed_model, groq_client, ors_client = load_clients()
 
 @st.cache_resource
 def load_nltk_data():
-    """Download and verify NLTK 'punkt' data."""
     try:
         nltk.data.find('tokenizers/punkt')
     except LookupError:
-        try:
-            nltk.download("punkt", quiet=True)
-            nltk.data.find('tokenizers/punkt')
-        except Exception as e:
-            st.error(f"❌ Failed to download NLTK 'punkt' data: {e}.")
-            return False
+        nltk.download("punkt", quiet=True)
     return True
 
 nltk_loaded = load_nltk_data()
 
-# --------------- Data Processing Functions ---------------
+# --------------- Data Processing & Categorization ---------------
+def categorize_location(name):
+    """Categorize a location based on keywords in its name for custom markers."""
+    name_lower = name.lower()
+    if any(keyword in name_lower for keyword in ['library']): return 'library'
+    if any(keyword in name_lower for keyword in ['research', 'lab', 'center']): return 'research'
+    if any(keyword in name_lower for keyword in ['dept', 'department', 'biochemistry', 'botany', 'math']): return 'academic'
+    if any(keyword in name_lower for keyword in ['admin', 'office', 'block']): return 'admin'
+    if any(keyword in name_lower for keyword in ['hostel', 'guesthouse']): return 'hostel'
+    return 'default'
+
 def process_uploaded_files(uploaded_files):
-    """Process uploaded files, creating a richer location map from CSVs."""
-    file_data = []
-    # MODIFIED: location_map is now a list of dicts for richer data
-    locations_list = []
-    
+    file_data, locations_list = [], []
     for uploaded_file in uploaded_files:
         try:
             file_name = uploaded_file.name
@@ -86,40 +93,29 @@ def process_uploaded_files(uploaded_files):
             if text: file_data.append({'text': text, 'source': file_name})
 
             if file_path.lower().endswith('.csv'):
-                # IMPROVED: Process CSV to handle aliases and more details
                 df = pd.read_csv(file_path)
                 df.columns = [col.strip().lower() for col in df.columns]
+                name_col, lat_col, lon_col, other_names_col = 'name', 'latitude', 'longitude', 'other names'
                 
-                # Standardize potential column names
-                name_col = next((c for c in ['name', 'department'] if c in df.columns), None)
-                lat_col = next((c for c in ['latitude', 'lat'] if c in df.columns), None)
-                lon_col = next((c for c in ['longitude', 'lon'] if c in df.columns), None)
-                other_names_col = next((c for c in ['other names', 'aliases'] if c in df.columns), None)
-
-                if name_col and lat_col and lon_col:
+                if all(c in df.columns for c in [name_col, lat_col, lon_col]):
                     for _, row in df.iterrows():
                         try:
                             primary_name = str(row[name_col]).strip()
                             lat, lon = float(row[lat_col]), float(row[lon_col])
-                            
                             if primary_name and -90 <= lat <= 90 and -180 <= lon <= 180:
-                                # Create a list of all possible names for this location
                                 all_names = {primary_name.lower()}
-                                if other_names_col and pd.notna(row[other_names_col]):
+                                if other_names_col in df.columns and pd.notna(row[other_names_col]):
                                     aliases = str(row[other_names_col]).split(',')
                                     all_names.update(alias.strip().lower() for alias in aliases if alias.strip())
                                 
-                                # Store all row data as a dictionary for context
                                 location_details = row.to_dict()
                                 location_details['primary_name'] = primary_name
                                 location_details['all_names'] = list(all_names)
-                                location_details['lat'] = lat
-                                location_details['lon'] = lon
-                                
+                                location_details['lat'], location_details['lon'] = lat, lon
+                                location_details['category'] = categorize_location(primary_name)
                                 locations_list.append(location_details)
                         except (ValueError, TypeError): continue
         except Exception as e: st.error(f"❌ Error processing {uploaded_file.name}: {e}")
-        
     return file_data, locations_list
 
 def extract_sentences(text_data):
@@ -167,160 +163,182 @@ def load_system_data():
         st.error(f"⚠️ Error loading system data: {e}"); return None, [], []
     return index, corpus, location_map
 
-# --------------- RAG & Chat Functions ---------------
+
+# --------------- RAG, Navigation & Chat Functions ---------------
 def retrieve_chunks(query, corpus, index, top_k=7):
     if not all([query, corpus, index, embed_model]): return []
     try:
         query_embedding = embed_model.encode([query])
         _, I = index.search(np.array(query_embedding, dtype="float32"), top_k)
         return [corpus[i] for i in I[0] if i < len(corpus)]
-    except Exception as e:
-        st.warning(f"⚠️ Retrieval error: {e}"); return []
+    except Exception: return []
 
 def match_locations(query, locations_list, score_cutoff=85):
-    """IMPROVED: Uses fuzzy matching to find the best location match from the query."""
     if not locations_list: return []
-    
-    # Create a flat list of all possible names to search against
     all_possible_names = []
     for i, loc in enumerate(locations_list):
-        for name in loc['all_names']:
-            all_possible_names.append((name, i)) # Store name and original index
-            
+        for name in loc['all_names']: all_possible_names.append((name, i))
     choices = [name for name, _ in all_possible_names]
-    
-    # Find the best match from the list of all names
     best_match = process.extractOne(query, choices, scorer=fuzz.partial_ratio, score_cutoff=score_cutoff)
-    
     if best_match:
-        # Find the original location dict using the index we stored
-        matched_name, score = best_match
+        matched_name, _ = best_match
         original_index = next(idx for name, idx in all_possible_names if name == matched_name)
         return [locations_list[original_index]]
-        
     return []
 
-def compute_distance_info(locations):
-    if len(locations) == 2:
-        try:
-            coord1 = (locations[0]["lat"], locations[0]["lon"])
-            coord2 = (locations[1]["lat"], locations[1]["lon"])
-            dist = geodesic(coord1, coord2)
-            unit, val = ("km", f"{dist.kilometers:.2f}") if dist.kilometers >= 1 else ("meters", f"{dist.meters:.0f}")
-            return f"The distance between {locations[0]['primary_name']} and {locations[1]['primary_name']} is approximately {val} {unit}."
-        except: return ""
-    return ""
-
-def ask_chatbot(query, context_chunks, matched_locations, distance_info):
-    """IMPROVED: Better prompt engineering for more focused answers."""
-    if not client: return "The AI assistant is currently offline."
+def get_turn_by_turn_directions(start, end):
+    if not ors_client:
+        return "Navigation service is not configured. An administrator must add an ORS_API_KEY."
     try:
-        lang_code = detect(query)
-        language = {'en': 'English', 'ur': 'Urdu', 'hi': 'Hindi'}.get(lang_code, 'English')
-    except LangDetectException: language = "English"
+        route_request = {'coordinates': [start[::-1], end[::-1]], 'format': 'json', 'profile': 'foot-walking', 'instructions': True}
+        route = ors_client.directions(**route_request)
+        steps = route['routes'][0]['segments'][0]['steps']
+        directions_text = "🚶‍♂️ **Here are your walking directions:**\n\n---\n"
+        for i, step in enumerate(steps):
+            directions_text += f"**{i+1}.** {step['instruction']} (for **{int(step['distance'])} meters**).\n"
+        return directions_text
+    except Exception as e:
+        return f"Could not retrieve directions. The service may be unavailable or out of range. Error: {e}"
 
+def ask_chatbot(query, context_chunks, matched_locations):
+    if not groq_client: return "AI assistant is not configured."
     context = "\n".join([chunk['sentence'] for chunk in context_chunks])
-    
-    # Prepare location context by formatting the dictionary
     geo_context = ""
     if matched_locations:
-        loc_info = []
-        for loc in matched_locations:
-            details = f"Location: {loc['primary_name']}"
-            if 'building' in loc and pd.notna(loc['building']): details += f", Building: {loc['building']}"
-            if 'floor' in loc and pd.notna(loc['floor']): details += f", Floor: {loc['floor']}"
-            details += f" (Lat: {loc['lat']:.5f}, Lon: {loc['lon']:.5f})"
-            loc_info.append(details)
-        geo_context = "\n".join(loc_info)
+        loc = matched_locations[0]
+        details = f"Location: {loc['primary_name']}"
+        if 'building' in loc and pd.notna(loc['building']): details += f", Building: {loc['building']}"
+        if 'floor' in loc and pd.notna(loc['floor']): details += f", Floor: {loc['floor']}"
+        geo_context = details
 
-    system_prompt = "You are CampusGPT, an expert assistant for a college campus. Your primary goal is to provide accurate and concise information based ONLY on the context provided. Do not use any external knowledge. If the context doesn't contain the answer, clearly state that you don't have enough information. When asked for details about a location, synthesize information from all relevant fields provided."
+    system_prompt = "You are CampusGPT, an expert assistant for a college campus. Your goal is to provide accurate, concise information based ONLY on the context provided. Do not use any external knowledge. If the context doesn't contain the answer, clearly state that you don't have enough information. Synthesize details from the provided location data when asked."
     prompt = f"""{system_prompt}
     ---
-    CONTEXT FROM DOCUMENTS:
-    {context if context else 'No relevant information was found in the documents.'}
+    CONTEXT FROM DOCUMENTS: {context if context else 'No relevant information found.'}
     ---
-    IDENTIFIED LOCATIONS AND THEIR DETAILS:
-    {geo_context if geo_context else 'No specific locations were mentioned or identified.'}
-    ---
-    CALCULATED DISTANCE:
-    {distance_info if distance_info else 'Not applicable.'}
+    IDENTIFIED LOCATION: {geo_context if geo_context else 'No specific location was mentioned.'}
     ---
     USER'S QUESTION: {query}
     ---
-    YOUR CONVERSATIONAL ANSWER (IN {language.upper()}):"""
+    YOUR ANSWER:"""
     try:
-        response = client.chat.completions.create(model="llama3-8b-8192", messages=[{"role": "user", "content": prompt}], temperature=0.5, max_tokens=1024)
+        response = groq_client.chat.completions.create(model="llama3-8b-8192", messages=[{"role": "user", "content": prompt}], temperature=0.5, max_tokens=1024)
         return response.choices[0].message.content
-    except Exception as e: return f"I apologize, but I encountered an error: {e}"
+    except Exception as e: return f"An error occurred with the AI model: {e}"
 
 # --------------- UI Components ---------------
 def create_map(locations):
+    """Creates a map with themed markers AND permanent text labels."""
     if not locations: return None
+    
+    marker_themes = {
+        'library': {'color': 'orange', 'icon': 'book'}, 'research': {'color': 'purple', 'icon': 'flask'},
+        'academic': {'color': 'blue', 'icon': 'university'}, 'admin': {'color': 'green', 'icon': 'building'},
+        'hostel': {'color': 'cadetblue', 'icon': 'home'}, 'default': {'color': 'darkblue', 'icon': 'info-sign'}
+    }
+    
     try:
         map_center = [np.mean([loc['lat'] for loc in locations]), np.mean([loc['lon'] for loc in locations])]
-        m = folium.Map(location=map_center, zoom_start=17, tiles='CartoDB positron', attr='CampusGPT Map')
+        m = folium.Map(location=map_center, zoom_start=17, tiles='CartoDB positron')
         for loc in locations:
-            google_maps_url = f"https://www.google.com/maps/search/?api=1&query={loc['lat']},{loc['lon']}"
+            theme = marker_themes.get(loc.get('category', 'default'), marker_themes['default'])
+            Maps_url = f"https://www.google.com/maps/search/?api=1&query={loc['lat']},{loc['lon']}"
+            popup_html = f"<b>{loc['primary_name']}</b><br><a href='{Maps_url}' target='_blank'>Navigate on Google Maps</a>"
             
-            desc = f"Building: {loc.get('building', 'N/A')}, Floor: {loc.get('floor', 'N/A')}"
-            
-            popup_html = f"""<div style="width: 220px; font-family: 'Inter', sans-serif;">
-                <h4 style="margin-bottom: 10px; color: #1e293b;">{loc['primary_name']}</h4>
-                <p style="margin-bottom: 12px; color: #475569;">{desc}</p>
-                <a href="{google_maps_url}" target="_blank" style="background-color: #5850ec; color: white; padding: 8px 12px; text-decoration: none; border-radius: 5px; display: inline-block; font-size: 14px; font-weight: 600;">Navigate on Google Maps</a>
-            </div>"""
+            # 1. Themed, clickable icon marker
             folium.Marker(
                 [loc['lat'], loc['lon']],
                 popup=folium.Popup(popup_html, max_width=270),
-                tooltip="Click for details & navigation",
-                icon=folium.Icon(color="darkblue", icon="location-arrow", prefix="fa")
+                tooltip=f"Click for details: {loc['primary_name']}",
+                icon=folium.Icon(color=theme['color'], icon=theme['icon'], prefix='fa')
+            ).add_to(m)
+
+            # 2. Permanent text label on the map
+            label_html = f'<div style="font-family: Arial, sans-serif; font-size: 11px; font-weight: bold; color: #2C3E50; background-color: rgba(255, 255, 255, 0.75); padding: 3px 6px; border-radius: 3px; border: 1px solid rgba(0,0,0,0.2); white-space: nowrap;">{loc["primary_name"]}</div>'
+            folium.Marker(
+                location=[loc['lat'], loc['lon']],
+                icon=folium.features.DivIcon(
+                    icon_size=(100, 36),
+                    icon_anchor=(-10, 15),
+                    html=label_html
+                )
             ).add_to(m)
         return m
     except Exception as e:
         st.error(f"🗺️ Map creation failed: {e}"); return None
-
-def display_welcome_message():
-    st.markdown("""<div class="welcome-card">
-        <h2>👋 Welcome to CampusGPT!</h2>
-        <p>An administrator needs to upload documents before you can ask questions.</p>
-        <h4>Admin Instructions:</h4><ol>
-        <li>Select <b>Admin</b> in the sidebar and enter the password.</li>
-        <li>Upload PDF, TXT, or CSV files and click <b>'Process & Build Index'</b>.</li></ol>
-    </div>""", unsafe_allow_html=True)
 
 # --------------- Main Streamlit App ---------------
 st.set_page_config(page_title="CampusGPT", page_icon="🏫", layout="wide")
 st.markdown("""<style>@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');html,body,[class*="st-"]{font-family:'Inter',sans-serif}.block-container{padding:1rem 2rem 2rem}.main-header h1{font-size:3.5rem;font-weight:700;background:-webkit-linear-gradient(45deg, #5850ec, #a855f7);-webkit-background-clip:text;-webkit-text-fill-color:transparent}.chat-message{display:flex;align-items:flex-start;max-width:85%;margin-bottom:1.5rem}.chat-bubble{padding:1rem 1.25rem;border-radius:1.25rem;box-shadow:0 4px 6px rgba(0,0,0,.05);line-height:1.6;word-wrap:break-word}.user-message{justify-content:flex-end;margin-left:auto}.user-message .chat-bubble{background-color:#5850ec;color:#fff;border-bottom-right-radius:.25rem}.user-message .chat-icon{margin-left:.75rem}.assistant-message{justify-content:flex-start}.assistant-message .chat-bubble{background-color:#f1f5f9;color:#1e293b;border-bottom-left-radius:.25rem}.assistant-message .chat-bubble a{color:#5850ec;font-weight:600}.chat-icon{font-size:1.5rem;color:#94a3b8;align-self:flex-start;margin-top:.25rem}.welcome-card{background-color:#f8fafc;border-left:5px solid #5850ec;padding:2rem;border-radius:.5rem;margin-top:2rem}</style>""", unsafe_allow_html=True)
 
 if "chat_history" not in st.session_state: st.session_state.chat_history = []
-if "authenticated" not in st.session_state: st.session_state.authenticated = False
-if 'confirm_delete' not in st.session_state: st.session_state.confirm_delete = False
+if "last_location" not in st.session_state: st.session_state.last_location = None
 
 index, corpus, location_map = load_system_data()
-system_ready = (index is not None and corpus) or bool(location_map)
+system_ready = bool(location_map)
 
 with st.sidebar:
     st.title("🏫 CampusGPT")
+    role = st.radio("Select Role", ["User", "Admin"], horizontal=True, label_visibility="collapsed")
     st.markdown("---")
-    role = st.radio("Select Your Role", ["👤 User", "🔧 Admin"], horizontal=True)
     if st.button("🗑️ Clear Chat History"):
-        st.session_state.chat_history = []; st.toast("Chat history cleared!", icon="🔄"); st.rerun()
-    st.markdown("---")
-    st.markdown("<div style='text-align:center;position:absolute;bottom:20px;width:80%;color:#888;'>Made with ❤️ by Zubair Yamin Suhaib</div>", unsafe_allow_html=True)
+        st.session_state.chat_history, st.session_state.last_location = [], None
+        st.toast("Chat history cleared!", icon="🔄"); st.rerun()
 
 st.markdown("<div class='main-header' style='text-align:center'><h1>CampusGPT</h1><p>Your Smart Campus Assistant</p></div>", unsafe_allow_html=True)
 
-if not client and role == "👤 User":
-    st.error("🔴 The AI Assistant is not configured. An administrator must set the GROQ_API_KEY in the Streamlit secrets.")
-    st.stop()
+if role == "User":
+    if not system_ready:
+        st.warning("System not ready. An administrator needs to upload documents first.")
+    else:
+        for msg in st.session_state.chat_history:
+            with st.chat_message(msg["role"], avatar='👤' if msg["role"] == "user" else '🏫'):
+                st.markdown(msg["content"], unsafe_allow_html=True)
+                if "map_data" in msg and msg["map_data"]:
+                    map_obj = create_map(msg["map_data"])
+                    if map_obj: st_folium(map_obj, width=700, height=450)
+        
+        if st.session_state.last_location and ors_client:
+            st.info(f"A location was found: **{st.session_state.last_location['primary_name']}**")
+            if st.button("Get Directions to this location 🚶‍♂️"):
+                user_geo = get_geolocation()
+                if user_geo:
+                    start_coords = (user_geo['coords']['latitude'], user_geo['coords']['longitude'])
+                    end_coords = (st.session_state.last_location['lat'], st.session_state.last_location['lon'])
+                    with st.spinner("Fetching walking directions..."):
+                        directions = get_turn_by_turn_directions(start_coords, end_coords)
+                    st.session_state.chat_history.append({"role": "assistant", "content": directions})
+                else:
+                    st.warning("Could not get your location. Please grant location permission in your browser.")
+                st.session_state.last_location = None
+                st.rerun()
 
-if role == "🔧 Admin":
-    if not st.session_state.authenticated:
+        if prompt := st.chat_input("Ask about campus locations, or for details..."):
+            st.session_state.chat_history.append({"role": "user", "content": prompt})
+            st.session_state.last_location = None
+            
+            with st.spinner("Thinking..."):
+                chunks = retrieve_chunks(prompt, corpus, index)
+                locs = match_locations(prompt, location_map)
+                response_content = ask_chatbot(prompt, chunks, locs)
+                response_msg = {"role": "assistant", "content": response_content}
+                
+                if len(locs) == 1:
+                    response_msg["map_data"] = locs
+                    st.session_state.last_location = locs[0]
+
+                st.session_state.chat_history.append(response_msg)
+                st.rerun()
+else: # Admin View
+    if not st.session_state.get("authenticated", False):
         st.subheader("🔐 Admin Login")
         password = st.text_input("Enter Password", type="password", key="admin_pass")
         if st.button("🔑 Login"):
-            if password == ADMIN_PASSWORD: st.session_state.authenticated = True; st.rerun()
-            else: st.error("❌ Incorrect password.")
+            if password == ADMIN_PASSWORD:
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("❌ Incorrect password.")
     else:
         st.subheader("⚙️ Admin Control Panel")
         tab1, tab2, tab3 = st.tabs(["📤 Upload & Process", "ℹ️ System Info", "📋 CSV Guide"])
@@ -334,45 +352,49 @@ if role == "🔧 Admin":
                         corpus_sentences = extract_sentences(file_data)
                         success, num_s, num_l = build_and_save_data(corpus_sentences, locations_list)
                         if success:
-                            if num_s > 0 or num_l > 0: st.success(f"✅ Processing complete! Saved {num_s} sentences and {num_l} locations."); st.balloons()
-                            else: st.warning("⚠️ No processable data found in the files.")
-                else: st.warning("Please upload at least one file.", icon="❗")
+                            if num_s > 0 or num_l > 0:
+                                st.success(f"✅ Processing complete! Saved {num_s} sentences and {num_l} locations.")
+                                st.balloons()
+                            else:
+                                st.warning("⚠️ No processable data found in the files.")
+                else:
+                    st.warning("Please upload at least one file.", icon="❗")
         with tab2:
             st.subheader("📊 System Status")
             st.metric("System Status", "✅ Ready" if system_ready else "❌ Not Ready")
-            c1, c2 = st.columns(2); c1.metric("Indexed Sentences", len(corpus)); c2.metric("Known Locations", len(location_map))
+            c1, c2 = st.columns(2)
+            c1.metric("Indexed Sentences", len(corpus))
+            c2.metric("Known Locations", len(location_map))
             with st.expander("📍 View Available Locations"):
                 if location_map:
-                    for loc in location_map: st.write(f"• {loc['primary_name']}")
-                else: st.write("No locations loaded.")
+                    for loc in location_map:
+                        st.write(f"• {loc['primary_name']}")
+                else:
+                    st.write("No locations loaded.")
+            st.markdown("---")
+            st.subheader("🚨 Danger Zone")
+            if st.button("🗑️ Clear All Data & Index", type="secondary"):
+                st.session_state.confirm_delete = True
+            if st.session_state.get("confirm_delete", False):
+                st.warning("**Are you sure?** This will delete all processed data. This action cannot be undone.")
+                col_del_1, col_del_2 = st.columns(2)
+                if col_del_1.button("Yes, I am sure, delete everything.", type="primary"):
+                    try:
+                        if os.path.exists(STORAGE_DIR): shutil.rmtree(STORAGE_DIR)
+                        if os.path.exists(DOCUMENTS_DIR): shutil.rmtree(DOCUMENTS_DIR)
+                        os.makedirs(DOCUMENTS_DIR, exist_ok=True); os.makedirs(STORAGE_DIR, exist_ok=True)
+                        st.session_state.confirm_delete = False
+                        st.success("All system data has been cleared.")
+                        st.rerun()
+                    except Exception as e: st.error(f"Failed to clear data: {e}")
+                if col_del_2.button("Cancel"):
+                     st.session_state.confirm_delete = False
+                     st.rerun()
         with tab3:
             st.markdown("Your CSV file should have `name`, `latitude`, `longitude`, and optionally `other names` columns.")
-            sample_df = pd.DataFrame({'name': ['Central Library', 'Botany Dept'], 'latitude': [34.07, 34.08], 'longitude': [74.81, 74.82], 'other names': ['Main Library', 'Bio-Sciences']})
+            sample_df = pd.DataFrame({
+                'name': ['Central Library', 'Botany Dept'], 'latitude': [34.07, 34.08], 
+                'longitude': [74.81, 74.82], 'other names': ['Main Library', 'Bio-Sciences Dept']
+            })
             st.dataframe(sample_df, use_container_width=True)
-else:  # User View
-    if not system_ready: display_welcome_message()
-    else:
-        for i, msg in enumerate(st.session_state.chat_history):
-            is_user = msg["role"] == "user"
-            st.markdown(f"""<div class="chat-message {'user-message' if is_user else 'assistant-message'}">
-                <div class="chat-icon">{'👤' if is_user else '🏫'}</div>
-                <div class="chat-bubble">{msg["content"]}</div>
-            </div>""", unsafe_allow_html=True)
-            if not is_user and "map_data" in msg and msg["map_data"]:
-                map_obj = create_map(msg["map_data"])
-                if map_obj: 
-                    st_folium(map_obj, width=700, height=450, key=f"map_{i}")
-                    # FIXED: Add caption below the map
-                    st.caption("Click any marker on the map for details and navigation.")
-        if prompt := st.chat_input("Ask about campus locations, distances, or general info..."):
-            st.session_state.chat_history.append({"role": "user", "content": prompt})
-            st.rerun()
-        if st.session_state.chat_history and st.session_state.chat_history[-1]["role"] == "user":
-            with st.spinner("🤔 Thinking..."):
-                last_prompt = st.session_state.chat_history[-1]["content"]
-                chunks = retrieve_chunks(last_prompt, corpus, index)
-                locs = match_locations(last_prompt, location_map)
-                dist_info = compute_distance_info(locs)
-                response = ask_chatbot(last_prompt, chunks, locs, dist_info)
-                st.session_state.chat_history.append({"role": "assistant", "content": response, "map_data": locs})
-                st.rerun()
+            st.download_button("⬇️ Download CSV Template", sample_df.to_csv(index=False).encode('utf-8'), "campus_locations_template.csv", "text/csv")
